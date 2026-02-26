@@ -1,0 +1,26 @@
+# R session files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# R package/build files
+*.Rcheck/
+*.tar.gz
+
+# Generated outputs (large files)
+outputs/catalog/
+outputs/mosaic/
+outputs/temp/
+outputs/sample/
+outputs/pdf/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# OAuth/credentials
+.httr-oauth
+
+# Quarto
+.quarto/
