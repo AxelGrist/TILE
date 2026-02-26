@@ -94,6 +94,5 @@ download_config <- list(
 - **LiDAR**: [LidarBC Open Data](https://www2.gov.bc.ca/gov/content/data/geographic-data-services/lidarbc)
 - **Processing**: [WhiteBox Tools](https://www.whiteboxgeo.com/)
 
-## Author
-
-BC Ministry of Forests - Omineca Region
+## Authors
+Axel Grist
