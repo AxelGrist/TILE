@@ -1,10 +1,14 @@
 # TILE: Tree Inventory and Landscape Evaluation
 
-A LiDAR processing tool for individual tree detection and terrain analysis in British Columbia.
+A LiDAR processing toolkit with dedicated ALS and TLS modules for forest structure analysis in British Columbia.
 
 ## Overview
 
-TILE processes airborne LiDAR data to generate:
+TILE now supports two module entry paths:
+- **ALS Module**: Airborne LiDAR processing (terrain products, canopy products, tree inventory)
+- **TLS Module**: Terrestrial LiDAR processing scaffold for stem/tree metric workflows
+
+The ALS workflow generates:
 - **Terrain Products**: Digital Terrain Model (DTM), Digital Surface Model (DSM), hillshade, slope, aspect
 - **Canopy Products**: Canopy Height Model (CHM)
 - **Tree Inventory**: Individual tree detection with location, height, and crown metrics
@@ -20,14 +24,14 @@ TILE processes airborne LiDAR data to generate:
 ## Requirements
 
 - **R** (>= 4.0)
-- **R Packages**: lidR, terra, sf, whitebox, future, parallel
+- **R Packages**: lidR, terra, sf, whitebox, future, parallel, viridis, ggplot2, httr, jsonlite, rgl
 - **WhiteBox Tools**: [Download here](https://www.whiteboxgeo.com/download-whiteboxtools/)
 
 ### Install R Packages
 
 ```r
 install.packages(c("lidR", "terra", "sf", "whitebox", "future", 
-                   "parallel", "viridis", "ggplot2", "httr", "jsonlite"))
+                   "parallel", "viridis", "ggplot2", "httr", "jsonlite", "rgl"))
 ```
 
 ## Project Structure
@@ -37,7 +41,10 @@ TILE/
 ├── TILE.Rproj          # RStudio project file
 ├── README.md           # This file
 ├── R/
-│   └── TILE.R          # Main processing script
+│   ├── TILE.R          # Module dispatcher (ALS by default)
+│   └── modules/
+│       ├── als_module.R  # Existing airborne LiDAR pipeline
+│       └── tls_module.R  # New terrestrial LiDAR scaffold
 └── outputs/
     ├── catalog/        # Terrain rasters (DTM, DSM, CHM, slope, aspect)
     ├── mosaic/         # Merged outputs
@@ -49,11 +56,23 @@ TILE/
 ## Usage
 
 1. Open `TILE.Rproj` in RStudio
-2. Edit configuration in `R/TILE.R`:
+2. Edit configuration in `R/modules/als_module.R`:
    - Set `main_dir` to your output directory
    - Set `source_folders` to your LiDAR data locations
    - Configure `processing_config` parameters
-3. Run the script
+3. Run `R/TILE.R` for ALS (default)
+
+### Switch Between Modules
+
+- **ALS (default):** run `R/TILE.R`
+- **TLS:** set environment variable `TILE_MODULE=TLS` before running `R/TILE.R`
+
+Example in R:
+
+```r
+Sys.setenv(TILE_MODULE = "TLS")
+source("R/TILE.R")
+```
 
 ### Configuration Options
 
