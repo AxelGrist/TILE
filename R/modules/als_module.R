@@ -16,7 +16,7 @@ library(parallel)
 # CONFIGURATION ----
 
 ## Project Paths
-main_dir        <- "D:/alpine_treemapping/TILE/outputs"    # Main output directory
+main_dir        <- "G:/alpine_treemapping/TILE/outputs_test"    # Main output directory
 whitebox_path   <- "C:/Program Files/WhiteboxTools_win_amd64/WBT/whitebox_tools.exe"
 
 ## Area of Interest
@@ -42,8 +42,8 @@ download_config <- list(
 
 ## LiDAR Source Folders
 source_folders <- c(
-  "V:/FOR_RNI_RNI_Projects/Research/Data_Lidar/Lidar/Omineca NE Data Transfered to GeoBC/PG_Final_Products/2020/2020_RE218210005_Robson_TSA/LiDAR",
-  "V:/FOR_RNI_RNI_Projects/Research/Data_Lidar/Lidar/Omineca NE Data Transfered to GeoBC/PG_Final_Products/2020/2020_RE218210006_Robson_TSA/LiDAR"
+  "U:/Data_Lidar/Lidar/Omineca NE Data Transfered to GeoBC/PG_Final_Products/2020/2020_RE218210005_Robson_TSA/LiDAR",
+  "U:/Data_Lidar/Lidar/Omineca NE Data Transfered to GeoBC/PG_Final_Products/2020/2020_RE218210006_Robson_TSA/LiDAR"
 )
 
 ## Target Files (Set to NULL to use all .laz files in source_folders)
@@ -507,7 +507,7 @@ cat("  Workers:", parallel_config$workers, "| Threads:", parallel_config$lidr_th
 
 
 # Initialize Sample Pipeline
-sample_pipeline <- function(las_file, main_dir = main_dir, 
+sample_pipeline <- function(las_file, main_dir = get("main_dir", envir = globalenv()),
                         bbox_size = processing_config$bbox_size, 
                         hmin = processing_config$hmin, 
                         hmax = processing_config$hmax, 
