@@ -2,17 +2,20 @@
 # TLS MODULE: Terrestrial Laser Scanner Processing
 # ============================================================================
 # Pipeline:
-#   1. Read + inspect cloud (lidR readLAS / las_check / field inventory).
+#   1. Read + inspect cloud (lidR readLAS / las_check).
 #   2. Pre-process at full density: dedupe, ground (CSF), normalize, SOR.
-#   3. Stem bases + CSP segmentation (Tao 2015 / Larysch 2025).
+#   3. Segmentation: TreeFilter -> overstory mask; TreeisoNet (StemCls ->
+#      TreeLoc -> shortestpath3D) -> TreeID per overstory point.
 #      3.1 Eigen geometry (fine + optional coarse / multi-scale).
 #      3.2 Sub-canopy foliage filter (global or stratified, optional gates).
 #      3.3 Stem base detection (shape-aware DBSCAN, plot-extent + continuity).
-#      3.4 CSP cost segmentation (assigns TreeID to every point).
-#   4. Forest inventory: DBH, height, position, crown projection per tree.
-#   5. Interactive plotting: 3D whole-plot + single-tree + 2D cross-sections.
-#   6. Field-data validation: buffered candidate search + multi-criteria match.
-#   7. TODO -- QSM (aRchi). Currently disabled while we hone segmentation.
+#      3.4 Segmentation dispatcher (treeisonet / csp / shs / nearest_base).
+#   4. WoodCls: wood/foliage DL classification -> WoodLabel per point.
+#   5. Per-tree QC PNGs: four-panel RGB + wood/foliage side views per TreeID.
+#   6. Forest inventory: DBH, height, position, crown projection per tree.
+#   7. Interactive plotting: 3D whole-plot + single-tree views (requires inv).
+#   8. Field-data validation: buffered candidate search + multi-criteria match.
+#   9. QSM: cut-pursuit over-segmentation + Dijkstra skeleton + cylinder fit.
 #
 # Refs:
 #   https://r-lidar.github.io/lidRbook/gnd.html
@@ -155,7 +158,7 @@ tls_params <- list(
   # QC plot toggle (rgl slab; red = dropped, green = kept)
   shrub_qc_plot          = TRUE,
 
-  # --- Section 5c: Per-tree 2D QC images ---------------------------------
+  # --- Section 5: Per-tree QC PNGs -----------------------------------
   # Save one PNG per TreeID under <out_dir>/tree_qc/. When RGB is available
   # in the LAS, each PNG is a 2x2 grid:
   #   top-row    : XZ + YZ in true RGB
@@ -213,7 +216,7 @@ tls_params <- list(
   # IMPORTANT (plot 311 calibration): low slices (<3 m) sit inside a dense
   # foliage skirt that daisy-chains adjacent stems through interlocking
   # branches. The 5-10 m mid-bole zone shows clean separated trunks. We
-  # detect bases there, then Section 4 recomputes XY from the [0.10, 0.50]
+  # detect bases there, then Section 6 recomputes XY from the [0.10, 0.50]
   # m base slice for any TreeID that has enough points there (otherwise
   # falls back to BH XY). This gives clump separation at altitude with
   # base-accurate XY where possible.
@@ -421,7 +424,7 @@ tls_params <- list(
                                  # 24 cores OOMs Dijkstra on dense plots.
                                  # 6-8 is the sweet spot.
 
-  # --- Section 4: Forest inventory + tree filter --------------------------
+  # --- Section 6: Forest inventory + tree filter --------------------------
   inv_slice_min        = 0.3,    # m; bottom of taper band
   inv_slice_max        = 4.0,    # m; top of taper band
   inv_increment        = 0.1,    # m; vertical step
@@ -457,7 +460,7 @@ tls_params <- list(
   # qsm_voxel: 2/5th of accuracy = densest spacing that still adds info.
   # Both derived after CONFIG closes.
 
-  # --- Section 6.2: Leaf-wood separation ----------------------------------
+  # --- Section 4: WoodCls / leaf-wood separation --------------------------
   # Eigen-feature based; eigen columns already exist on the cloud from
   # Section 3.1. Wood = high Linearity AND low Sphericity AND low Planarity.
   # On conifers, sphericity does most of the work; on broadleaves (At),
@@ -475,11 +478,11 @@ tls_params <- list(
   lws_hag_max_for_wood = NA_real_,
   lws_exg_max          = 0.10,
 
-  # --- Section 7: WoodCls -------------------------------------------------
+  # --- Section 4: WoodCls (DL classifier) --------------------------------
   # WoodCls runs a supervised DL binary classifier (ESegFormer3D) per point
   # to separate wood (branches + trunk, label=2) from foliage (label=1).
   # Output is written to las@data$WoodLabel.
-  # The QSM pipeline (Section 8) uses WoodLabel==2 points as input.
+  # The QSM pipeline (Section 9) uses WoodLabel==2 points as input.
   # Set woodcls_model = NA_character_ to skip (QSM will not run either).
   #
   # Recommended models:
@@ -489,7 +492,7 @@ tls_params <- list(
   woodcls_model  = "woodcls_branch_tls_esegformer3D_128_2.5cm(GPU3GB)",
   woodcls_device = "auto",   # "auto" | "cuda" | "cpu"
 
-  # --- Section 8: QSM (TreeAIBox) -----------------------------------------
+  # --- Section 9: QSM (TreeAIBox) -----------------------------------------
   # Builds a Quantitative Structure Model per tree using the applyQSM
   # pipeline (Xi et al.; cut-pursuit over-segmentation + Dijkstra skeleton +
   # algebraic circle-fit radii). Requires treeisoR >= 0.2.0 (cut_pursuit_segment).
@@ -510,12 +513,12 @@ tls_params <- list(
   qsm_threads            = 1L,      # OpenMP threads for cut-pursuit
   qsm_out_dir            = NA_character_,  # NA = use out_dir from pipeline
 
-  # --- Section 6: Field-data validation -----------------------------------
+  # --- Section 8: Field-data validation -----------------------------------
   # For each field tree, find ALL TLS candidates inside a buffer radius,
   # then pick the candidate with the lowest weighted score across
   # available metrics (xy / dbh / height / azimuth / distance).
   # Matched field info is written back as columns on `inv` (prefix `f_`).
-  # Setting field_xlsx_path = NA disables Section 6.
+  # Setting field_xlsx_path = NA disables Section 8.
   field_xlsx_path      = "C:/Users/AGRIST/OneDrive - Government of BC/Sklar, Daniel FOR_EX's files - Great Beaver Lake/trees.xlsx",
   field_sheet          = 1,
   field_col_id         = "tree_id",
@@ -629,7 +632,7 @@ print(las)
 
 # LAS field inventory -- which extra signals are actually populated?
 # Used to decide whether the optional Intensity / NumberOfReturns / RGB
-# gates in the leaf-wood separation block (Section 6) are worth enabling.
+# gates in the leaf-wood separation block (Section 4) are worth enabling.
 local({
   d <- las@data
   message("LAS field inventory:")
@@ -1600,13 +1603,171 @@ las <- switch(method,
 )
 
 
+# 4. WoodCls  (wood / foliage classification)
 # ============================================================================
-# 4. FOREST INVENTORY
+# Separates wood points (branches + trunk, label=2) from foliage (label=1)
+# using a supervised DL classifier (ESegFormer3D) and writes the result to
+# las@data$WoodLabel.  The QSM step (Section 9) uses WoodLabel==2 as input.
+# Skip by setting tls_params$woodcls_model = NA_character_.
+
+if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
+  wc_device <- if (identical(tls_params$woodcls_device, "auto")) {
+    if (torch::cuda_is_available()) "cuda" else "cpu"
+  } else tls_params$woodcls_device
+
+  message(sprintf("[7] WoodCls: loading model '%s' on %s...",
+                  tls_params$woodcls_model, wc_device))
+  wc_bundle  <- treeAIBoxR::load_treeaibox_model(
+    model_name = tls_params$woodcls_model, device = wc_device)
+
+  wc_pts <- as.matrix(las@data[, c("X", "Y", "Z")])
+  message(sprintf("[7] WoodCls: classifying %d points...", nrow(wc_pts)))
+  wc_labels <- treeAIBoxR::classify_wood(wc_pts, wc_bundle, verbose = FALSE)
+  las@data$WoodLabel <- as.integer(wc_labels)
+
+  n_wood <- sum(wc_labels >= 2L)
+  message(sprintf("[7] WoodCls done: %d / %d wood points (%.1f%%).",
+                  n_wood, nrow(wc_pts),
+                  100 * n_wood / nrow(wc_pts)))
+  rm(wc_pts, wc_bundle, wc_labels); invisible(gc())
+} else {
+  message("[7] WoodCls skipped (tls_params$woodcls_model is NA).")
+  # Write a default WoodLabel of 2 (all points treated as wood) so Section 9
+  # can still run if manually triggered with woodcls_model = NA.
+  if (!"WoodLabel" %in% names(las@data))
+    las@data$WoodLabel <- 2L
+}
+
+
+# ============================================================================
+# 5. Per-tree QC PNGs
+# ============================================================================
+# Four-panel side views per TreeID written to <out_dir>/<tree_qc_subdir>/.
+# Placed after WoodCls so las@data$WoodLabel is available for the
+# wood/foliage panels (bottom row). No re-inference needed.
+# Runs in batch (builds qc_las locally; does not require Section 7 rgl).
+if (isTRUE(tls_params$tree_qc_enable)) {
+  qc_dir <- file.path(out_dir, tls_params$tree_qc_subdir)
+  if (dir.exists(qc_dir))
+    invisible(file.remove(list.files(qc_dir, pattern = "\\.png$", full.names = TRUE)))
+  dir.create(qc_dir, showWarnings = FALSE, recursive = TRUE)
+  qc_las <- if (exists("las_seg")) las_seg else
+            lidR::filter_poi(las, TreeID %in% inv$TreeID)
+  data.table::setDT(qc_las@data)
+  qc_ids <- sort(unique(qc_las@data$TreeID))
+  qc_ids <- qc_ids[!is.na(qc_ids)]
+  if (!is.na(tls_params$tree_qc_top_n) &&
+      tls_params$tree_qc_top_n < length(qc_ids)) {
+    ord <- order(-inv$DBH[match(qc_ids, inv$TreeID)], na.last = TRUE)
+    qc_ids <- qc_ids[ord][seq_len(tls_params$tree_qc_top_n)]
+  }
+  hw <- tls_params$tree_qc_xy_halfwidth
+  has_rgb <- isTRUE(tls_params$tree_qc_use_rgb) &&
+             all(c("R", "G", "B") %in% names(qc_las@data)) &&
+             { rgb_max <- max(qc_las@data$R, qc_las@data$G, qc_las@data$B,
+                              na.rm = TRUE)
+               isTRUE(is.finite(rgb_max) && rgb_max > 0) }
+  rgb_div <- if (has_rgb) {
+    if (max(qc_las@data$R, qc_las@data$G, qc_las@data$B, na.rm = TRUE) > 256) 65535
+    else 255
+  } else NA_real_
+  wood_col <- tls_params$tree_qc_wood_color
+  fol_col  <- tls_params$tree_qc_foliage_color
+  has_woodlabel <- "WoodLabel" %in% names(qc_las@data)
+  wf_method <- if (has_woodlabel) "woodlabel" else tls_params$tree_qc_wf_method
+  treeaibox_model <- if (!has_woodlabel && identical(tls_params$tree_qc_wf_method, "treeaibox")) {
+    message("Loading TreeAIBox model for QC wood/foliage coloring...")
+    load_treeaibox_lazy(tls_params)
+  } else NULL
+  if (has_woodlabel)
+    message("Per-tree QC wood/foliage: using WoodLabel from Section 4 (no re-inference).")
+  message(sprintf("Saving %d per-tree QC PNGs to %s%s (wood/foliage: %s)",
+                  length(qc_ids), qc_dir,
+                  if (has_rgb) " [RGB]" else " [cyan/orange]",
+                  wf_method))
+  for (id in qc_ids) {
+    pts <- qc_las@data[TreeID == id]
+    if (nrow(pts) < tls_params$tree_qc_min_points) next
+    inv_row <- inv[inv$TreeID == id, ]
+    dbh <- if (nrow(inv_row)) inv_row$DBH[1]    else NA_real_
+    ht  <- if (nrow(inv_row)) inv_row$Height[1] else NA_real_
+    fid <- if (nrow(inv_row) && "f_id" %in% names(inv_row)) inv_row$f_id[1] else NA
+    cx  <- median(pts$X); cy <- median(pts$Y)
+    if (has_rgb) {
+      r8 <- pmin(pmax(pts$R / rgb_div, 0), 1)
+      g8 <- pmin(pmax(pts$G / rgb_div, 0), 1)
+      b8 <- pmin(pmax(pts$B / rgb_div, 0), 1)
+      rgb_col <- grDevices::rgb(r8, g8, b8)
+      is_foliage <- if (has_woodlabel) {
+        pts$WoodLabel == 1L
+      } else {
+        tryCatch(
+          classify_wf(pts, tls_params, treeaibox_model = treeaibox_model),
+          error = function(e) {
+            warning("classify_wf failed for TreeID ", id,
+                    ": ", conditionMessage(e), call. = FALSE)
+            rep(TRUE, nrow(pts))
+          })
+      }
+      wf_col <- ifelse(is_foliage, fol_col, wood_col)
+      png(file.path(qc_dir, sprintf("tree_%04d.png", id)),
+          width = 1600, height = 1400, bg = "black", res = 110)
+      op <- par(mfrow = c(2, 2), bg = "black", fg = "white",
+                col.axis = "white", col.lab = "white", col.main = "white",
+                mar = c(4, 4, 3, 1))
+      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = rgb_col,
+           xlab = "X offset (m)", ylab = "Z (m)",
+           main = sprintf("TreeID %d  RGB XZ  (look along Y)", id),
+           asp = 1, xlim = c(-hw, hw))
+      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = rgb_col,
+           xlab = "Y offset (m)", ylab = "Z (m)",
+           main = sprintf("RGB YZ  DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
+                          ifelse(is.na(dbh), NA, dbh * 100),
+                          ht, nrow(pts),
+                          ifelse(is.na(fid), "none", as.character(fid))),
+           asp = 1, xlim = c(-hw, hw))
+      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = wf_col,
+           xlab = "X offset (m)", ylab = "Z (m)",
+           main = sprintf("Wood/Foliage XZ  [%s] foliage=%.0f%%",
+                          wf_method, 100 * mean(is_foliage)),
+           asp = 1, xlim = c(-hw, hw))
+      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = wf_col,
+           xlab = "Y offset (m)", ylab = "Z (m)",
+           main = "Wood/Foliage YZ",
+           asp = 1, xlim = c(-hw, hw))
+      par(op); dev.off()
+    } else {
+      png(file.path(qc_dir, sprintf("tree_%04d.png", id)),
+          width = 1400, height = 900, bg = "black", res = 110)
+      op <- par(mfrow = c(1, 2), bg = "black", fg = "white",
+                col.axis = "white", col.lab = "white", col.main = "white",
+                mar = c(4, 4, 3, 1))
+      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.6, col = "cyan",
+           xlab = "X offset (m)", ylab = "Z (m)",
+           main = sprintf("TreeID %d  XZ view  (look along Y)", id),
+           asp = 1, xlim = c(-hw, hw))
+      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.6, col = "orange",
+           xlab = "Y offset (m)", ylab = "Z (m)",
+           main = sprintf("DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
+                          ifelse(is.na(dbh), NA, dbh * 100),
+                          ht, nrow(pts),
+                          ifelse(is.na(fid), "none", as.character(fid))),
+           asp = 1, xlim = c(-hw, hw))
+      par(op); dev.off()
+    }
+  }
+  message("Per-tree QC done: ", qc_dir)
+}
+
+
+# ============================================================================
+# ============================================================================
+# 6. FOREST INVENTORY
 # ============================================================================
 # Fits circles in thin slices and splines DBH/X/Y vs Z. Returns one row per
 # TreeID with X, Y, DBH, Height, ConvexHullArea, quality_flag.
 
-# 4.1 Patch CspStandSegmentation::forest_inventory ---------------------------
+# 6.1 Patch CspStandSegmentation::forest_inventory ---------------------------
 # Bug: q = 1 - sqrt(100 / nrow(slice)) + 0.05 exceeds 1 when slice has
 # >~38k points (-> quantile() probs out of [0,1]). PR submitted upstream.
 # Safe to delete this block once the merged version is reinstalled via:
@@ -1632,7 +1793,7 @@ local({
 })
 
 
-# 4.2 Run inventory + DBH/Height filter --------------------------------------
+# 6.2 Run inventory + DBH/Height filter --------------------------------------
 inv_input <- decimate_points(las, random_per_voxel(tls_params$inv_thin_voxel, n = 1L))
 
 inv <- CspStandSegmentation::forest_inventory(inv_input,
@@ -1695,7 +1856,7 @@ writeLAS(las,  file.path(out_dir, "plot_classified.laz"))
 
 
 # ============================================================================
-# 5. INTERACTIVE PLOTTING
+# 7. INTERACTIVE PLOTTING
 # ============================================================================
 # Whole-plot view (every TreeID labeled) + single-tree view at full density.
 
@@ -1759,10 +1920,9 @@ if (interactive()) {
 }
 
 
-# 5c. Per-tree QC PNGs moved to Section 7b (after WoodCls) so that
-# WoodLabel is available for the wood/foliage panels.
+# 7c. Note: per-tree QC PNGs are in Section 5 (after WoodCls/Section 4).
 
-# ---- wood/foliage classifier helpers (used by Section 7b) ----------------
+# ---- wood/foliage classifier helpers (used by Section 5) ----------------
 # Local-PCA linearity classifier. Per point, take its k nearest neighbours,
 # build the 3x3 covariance, eigenvalue-decompose, compute
 # linearity = (l1 - l2) / l1. Above the threshold => wood.
@@ -1851,7 +2011,7 @@ classify_wf <- function(pts, tls_params, treeaibox_model = NULL) {
 
 
 # ============================================================================
-# 6. FIELD-DATA VALIDATION
+# 8. FIELD-DATA VALIDATION
 # ============================================================================
 # For each field-tally tree:
 #   1. Gather all TLS candidates within `field_match_buffer` (XY radius).
@@ -1869,7 +2029,7 @@ if (!is.na(tls_params$field_xlsx_path) &&
     file.exists(tls_params$field_xlsx_path)) {
 
   if (!requireNamespace("readxl", quietly = TRUE))
-    stop("Section 6 requires the readxl package.")
+    stop("Section 8 requires the readxl package.")
 
   field <- as.data.frame(readxl::read_excel(
     tls_params$field_xlsx_path, sheet = tls_params$field_sheet))
@@ -1888,7 +2048,7 @@ if (!is.na(tls_params$field_xlsx_path) &&
                     as.character(tls_params$field_plot_filter), nrow(field)))
   }
   if (!nrow(field))
-    stop("Section 6: no field rows after plot filter.")
+    stop("Section 8: no field rows after plot filter.")
 
   # Pull each configured column if its name is set + present in the sheet.
   # Always returns either NULL (column absent) or a vector of length nrow(field)
@@ -2121,178 +2281,20 @@ if (!is.na(tls_params$field_xlsx_path) &&
   write.csv(inv, file.path(out_dir, "inventory_field_matched.csv"),
             row.names = FALSE)
 } else {
-  message("Section 6 skipped (tls_params$field_xlsx_path is NA or missing).")
+  message("Section 8 skipped (tls_params$field_xlsx_path is NA or missing).")
 }
 
 
 # ============================================================================
-# 7. WoodCls  (wood / foliage classification)
-# ============================================================================
-# Separates wood points (branches + trunk, label=2) from foliage (label=1)
-# using a supervised DL classifier (ESegFormer3D) and writes the result to
-# las@data$WoodLabel.  The QSM step (Section 8) uses WoodLabel==2 as input.
-# Skip by setting tls_params$woodcls_model = NA_character_.
-
-if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
-  wc_device <- if (identical(tls_params$woodcls_device, "auto")) {
-    if (torch::cuda_is_available()) "cuda" else "cpu"
-  } else tls_params$woodcls_device
-
-  message(sprintf("[7] WoodCls: loading model '%s' on %s...",
-                  tls_params$woodcls_model, wc_device))
-  wc_bundle  <- treeAIBoxR::load_treeaibox_model(
-    model_name = tls_params$woodcls_model, device = wc_device)
-
-  wc_pts <- as.matrix(las@data[, c("X", "Y", "Z")])
-  message(sprintf("[7] WoodCls: classifying %d points...", nrow(wc_pts)))
-  wc_labels <- treeAIBoxR::classify_wood(wc_pts, wc_bundle, verbose = FALSE)
-  las@data$WoodLabel <- as.integer(wc_labels)
-
-  n_wood <- sum(wc_labels >= 2L)
-  message(sprintf("[7] WoodCls done: %d / %d wood points (%.1f%%).",
-                  n_wood, nrow(wc_pts),
-                  100 * n_wood / nrow(wc_pts)))
-  rm(wc_pts, wc_bundle, wc_labels); invisible(gc())
-} else {
-  message("[7] WoodCls skipped (tls_params$woodcls_model is NA).")
-  # Write a default WoodLabel of 2 (all points treated as wood) so Section 8
-  # can still run if manually triggered with woodcls_model = NA.
-  if (!"WoodLabel" %in% names(las@data))
-    las@data$WoodLabel <- 2L
-}
-
-
-# ============================================================================
-# 7b. Per-tree QC PNGs
-# ============================================================================
-# Four-panel side views per TreeID written to <out_dir>/<tree_qc_subdir>/.
-# Placed after WoodCls so las@data$WoodLabel is available for the
-# wood/foliage panels (bottom row). No re-inference needed.
-# Runs in batch (builds qc_las locally; does not require Section 5 rgl).
-if (isTRUE(tls_params$tree_qc_enable)) {
-  qc_dir <- file.path(out_dir, tls_params$tree_qc_subdir)
-  if (dir.exists(qc_dir))
-    invisible(file.remove(list.files(qc_dir, pattern = "\\.png$", full.names = TRUE)))
-  dir.create(qc_dir, showWarnings = FALSE, recursive = TRUE)
-  qc_las <- if (exists("las_seg")) las_seg else
-            lidR::filter_poi(las, TreeID %in% inv$TreeID)
-  data.table::setDT(qc_las@data)
-  qc_ids <- sort(unique(qc_las@data$TreeID))
-  qc_ids <- qc_ids[!is.na(qc_ids)]
-  if (!is.na(tls_params$tree_qc_top_n) &&
-      tls_params$tree_qc_top_n < length(qc_ids)) {
-    ord <- order(-inv$DBH[match(qc_ids, inv$TreeID)], na.last = TRUE)
-    qc_ids <- qc_ids[ord][seq_len(tls_params$tree_qc_top_n)]
-  }
-  hw <- tls_params$tree_qc_xy_halfwidth
-  has_rgb <- isTRUE(tls_params$tree_qc_use_rgb) &&
-             all(c("R", "G", "B") %in% names(qc_las@data)) &&
-             { rgb_max <- max(qc_las@data$R, qc_las@data$G, qc_las@data$B,
-                              na.rm = TRUE)
-               isTRUE(is.finite(rgb_max) && rgb_max > 0) }
-  rgb_div <- if (has_rgb) {
-    if (max(qc_las@data$R, qc_las@data$G, qc_las@data$B, na.rm = TRUE) > 256) 65535
-    else 255
-  } else NA_real_
-  wood_col <- tls_params$tree_qc_wood_color
-  fol_col  <- tls_params$tree_qc_foliage_color
-  has_woodlabel <- "WoodLabel" %in% names(qc_las@data)
-  wf_method <- if (has_woodlabel) "woodlabel" else tls_params$tree_qc_wf_method
-  treeaibox_model <- if (!has_woodlabel && identical(tls_params$tree_qc_wf_method, "treeaibox")) {
-    message("Loading TreeAIBox model for QC wood/foliage coloring...")
-    load_treeaibox_lazy(tls_params)
-  } else NULL
-  if (has_woodlabel)
-    message("Per-tree QC wood/foliage: using WoodLabel from Section 7 (no re-inference).")
-  message(sprintf("Saving %d per-tree QC PNGs to %s%s (wood/foliage: %s)",
-                  length(qc_ids), qc_dir,
-                  if (has_rgb) " [RGB]" else " [cyan/orange]",
-                  wf_method))
-  for (id in qc_ids) {
-    pts <- qc_las@data[TreeID == id]
-    if (nrow(pts) < tls_params$tree_qc_min_points) next
-    inv_row <- inv[inv$TreeID == id, ]
-    dbh <- if (nrow(inv_row)) inv_row$DBH[1]    else NA_real_
-    ht  <- if (nrow(inv_row)) inv_row$Height[1] else NA_real_
-    fid <- if (nrow(inv_row) && "f_id" %in% names(inv_row)) inv_row$f_id[1] else NA
-    cx  <- median(pts$X); cy <- median(pts$Y)
-    if (has_rgb) {
-      r8 <- pmin(pmax(pts$R / rgb_div, 0), 1)
-      g8 <- pmin(pmax(pts$G / rgb_div, 0), 1)
-      b8 <- pmin(pmax(pts$B / rgb_div, 0), 1)
-      rgb_col <- grDevices::rgb(r8, g8, b8)
-      is_foliage <- if (has_woodlabel) {
-        pts$WoodLabel == 1L
-      } else {
-        tryCatch(
-          classify_wf(pts, tls_params, treeaibox_model = treeaibox_model),
-          error = function(e) {
-            warning("classify_wf failed for TreeID ", id,
-                    ": ", conditionMessage(e), call. = FALSE)
-            rep(TRUE, nrow(pts))
-          })
-      }
-      wf_col <- ifelse(is_foliage, fol_col, wood_col)
-      png(file.path(qc_dir, sprintf("tree_%04d.png", id)),
-          width = 1600, height = 1400, bg = "black", res = 110)
-      op <- par(mfrow = c(2, 2), bg = "black", fg = "white",
-                col.axis = "white", col.lab = "white", col.main = "white",
-                mar = c(4, 4, 3, 1))
-      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = rgb_col,
-           xlab = "X offset (m)", ylab = "Z (m)",
-           main = sprintf("TreeID %d  RGB XZ  (look along Y)", id),
-           asp = 1, xlim = c(-hw, hw))
-      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = rgb_col,
-           xlab = "Y offset (m)", ylab = "Z (m)",
-           main = sprintf("RGB YZ  DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
-                          ifelse(is.na(dbh), NA, dbh * 100),
-                          ht, nrow(pts),
-                          ifelse(is.na(fid), "none", as.character(fid))),
-           asp = 1, xlim = c(-hw, hw))
-      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = wf_col,
-           xlab = "X offset (m)", ylab = "Z (m)",
-           main = sprintf("Wood/Foliage XZ  [%s] foliage=%.0f%%",
-                          wf_method, 100 * mean(is_foliage)),
-           asp = 1, xlim = c(-hw, hw))
-      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = wf_col,
-           xlab = "Y offset (m)", ylab = "Z (m)",
-           main = "Wood/Foliage YZ",
-           asp = 1, xlim = c(-hw, hw))
-      par(op); dev.off()
-    } else {
-      png(file.path(qc_dir, sprintf("tree_%04d.png", id)),
-          width = 1400, height = 900, bg = "black", res = 110)
-      op <- par(mfrow = c(1, 2), bg = "black", fg = "white",
-                col.axis = "white", col.lab = "white", col.main = "white",
-                mar = c(4, 4, 3, 1))
-      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.6, col = "cyan",
-           xlab = "X offset (m)", ylab = "Z (m)",
-           main = sprintf("TreeID %d  XZ view  (look along Y)", id),
-           asp = 1, xlim = c(-hw, hw))
-      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.6, col = "orange",
-           xlab = "Y offset (m)", ylab = "Z (m)",
-           main = sprintf("DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
-                          ifelse(is.na(dbh), NA, dbh * 100),
-                          ht, nrow(pts),
-                          ifelse(is.na(fid), "none", as.character(fid))),
-           asp = 1, xlim = c(-hw, hw))
-      par(op); dev.off()
-    }
-  }
-  message("Per-tree QC done: ", qc_dir)
-}
-
-
-# ============================================================================
-# 8. QSM — TreeAIBox applyQSM pipeline
+# 9. QSM — TreeAIBox applyQSM pipeline
 # ============================================================================
 # Builds a per-tree Quantitative Structure Model (QSM) using cut-pursuit
 # over-segmentation + Dijkstra skeleton + algebraic circle-fit radii.
 # Matches the TreeAIBox GUI "Apply QSM" workflow (applyQSM.py).
 #
 # Prerequisites:
-#   - Section 5 must have run (las@data$TreeID and las@data$StemCls present)
-#   - Section 7 WoodCls should have run (las@data$WoodLabel present);
+#   - Section 3 must have run (las@data$TreeID and las@data$StemCls present)
+#   - Section 4 WoodCls should have run (las@data$WoodLabel present);
 #     if WoodLabel is absent all points are treated as wood.
 #   - treeisoR package must be rebuilt with cut_pursuit_segment() exported.
 #     (Run: install_treeisoR.R or reinstall treeisoR when no R session is open)
@@ -2306,7 +2308,7 @@ local({
   # Guard: TreeID column is mandatory
   if (!"TreeID" %in% names(las@data)) {
     message("[8] QSM skipped: las@data$TreeID not present ",
-            "(run Section 5 first).")
+            "(run Section 3 first).")
     return(invisible(NULL))
   }
 
@@ -2426,6 +2428,5 @@ local({
 
 
 # ============================================================================
-# (old Section 7 -- field validation -- moved up to Section 6 above)
 # ============================================================================
 
