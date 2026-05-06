@@ -90,7 +90,9 @@ classify_wood <- function(xyz, model, if_bottom_only = FALSE,
     # Output want: (1, D, H, W, C) = positions (1,5,4,3,2)
     h <- h$permute(c(1L, 5L, 4L, 3L, 2L))$contiguous()  # (1, D, H, W, C)
     h <- h$reshape(c(nb_tsz, num_classes))    # (D*H*W, C)
-    h_sub <- h[occ_idx, ]                     # (n_unique_voxels, C)
+    h_sub <- h[occ_idx, ]$reshape(c(-1L, num_classes))  # always (n_unique_voxels, C)
+    # R tensor [idx, ] drops the row dim when length(idx)==1 (like base R).
+    # $reshape(-1, C) restores 2D shape in that edge case.
     cls   <- as.integer(torch::torch_argmax(h_sub, dim = 2L)$cpu())
     # torch_argmax uses 1-based dim (like all R torch indexing).
     # dim=2L = axis 1 in 0-based = columns (C) of (n_voxels, C) tensor.
