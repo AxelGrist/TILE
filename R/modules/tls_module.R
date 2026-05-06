@@ -492,6 +492,17 @@ tls_params <- list(
   woodcls_model  = "woodcls_branch_tls_esegformer3D_128_2.5cm(GPU3GB)",
   woodcls_device = "auto",   # "auto" | "cuda" | "cpu"
 
+  # --- Section 4b: Downed log detection (Xi class 4) ----------------------
+  # Wood points (WoodLabel >= 2) near the ground whose local neighborhood
+  # is predominantly horizontal (primary PCA axis tilted > downed_tilt_min_deg
+  # from vertical) are flagged as downed logs.
+  # Z is height above ground (already normalized in Section 2.1).
+  downed_log_enable   = TRUE,   # FALSE to skip and leave class 4 unpopulated
+  downed_z_max        = 1.5,    # m above ground; candidates above this are skipped
+  downed_knn_radius   = 0.3,    # m; 3D radius for PCA neighbourhood
+  downed_knn_min_pts  = 5L,     # minimum neighbours for reliable PCA
+  downed_tilt_min_deg = 45.0,   # primary eigenvector tilt from vertical (degrees)
+
   # --- Section 9: QSM (TreeAIBox) -----------------------------------------
   # Builds a Quantitative Structure Model per tree using the applyQSM
   # pipeline (Xi et al.; cut-pursuit over-segmentation + Dijkstra skeleton +
@@ -607,9 +618,9 @@ plot_cloud_qc <- function(pts,
                 "1" = "#E63000",   # Stem             (red)
                 "2" = "#8B3A00",   # Branch           (reddish-brown)
                 "3" = "#1A6B1A",   # Foliage          (forest green)
-                "4" = "#8B00CC",   # Downed woody log (purple)   -- reserved
-                "5" = "#FF69B4",   # Sapling stem     (pink)     -- reserved
-                "6" = "#6A5ACD",   # Below-canopy br. (slate blue) -- reserved
+                "4" = "#8B00CC",   # Downed woody log (purple)
+                "5" = "#FF69B4",   # Sapling stem     (pink)
+                "6" = "#6A5ACD",   # Below-canopy br. (slate blue)
                 "7" = "#1E5FCC")   # Ground           (blue)
     lbl <- compute_xi_label(ds)
     xi_pal[as.character(lbl)]
@@ -634,11 +645,12 @@ plot_cloud_qc <- function(pts,
   if (color_by == "XiLabel")
     rgl::legend3d("topright",
                   legend = c("0 Grass/remaining", "1 Stem", "2 Branch",
-                             "3 Foliage", "5 Sapling stem",
-                             "6 Below-canopy branch", "7 Ground"),
+                             "3 Foliage", "4 Downed log",
+                             "5 Sapling stem", "6 Below-canopy branch",
+                             "7 Ground"),
                   col    = c("#ADFF2F", "#E63000", "#8B3A00",
-                             "#1A6B1A", "#FF69B4",
-                             "#6A5ACD", "#1E5FCC"),
+                             "#1A6B1A", "#8B00CC",
+                             "#FF69B4", "#6A5ACD", "#1E5FCC"),
                   pch = 19, bty = "n", cex = 1.1)
   invisible(ds)
 }
@@ -646,8 +658,9 @@ plot_cloud_qc <- function(pts,
 # compute_xi_label(): derive Xi 2023 8-class composite label from pipeline columns.
 # Uses: Classification (ground), TreeFilterLabel (overstory mask),
 #       StemCls (stem detection), WoodLabel (wood/foliage).
-# Classes 4/5/6 (downed logs, saplings, below-canopy branches) are not yet
-# distinguishable and remain in class 0 (Grass/remaining).
+# Class 4 (downed logs): wood points near ground (Z <= downed_z_max) with
+# horizontal primary PCA axis (tilt > downed_tilt_min_deg); written to
+# las@data$DownedLog by Section 4, read here via the has_dl guard.
 compute_xi_label <- function(ds) {
   if (inherits(ds, "LAS")) ds <- ds@data
   n   <- nrow(ds)
@@ -688,6 +701,14 @@ compute_xi_label <- function(ds) {
 
   # Sapling stem: understory + StemCls == 2 (highest understory priority)
   if (has_sc) lbl[us & ds$StemCls == 2L] <- 5L
+
+  # ---- Downed log (class 4) -----------------------------------------------
+  # Overrides understory branch (6) and understory stem (5) for wood points
+  # flagged as horizontally-oriented by the PCA tilt test in Section 4.
+  # Does NOT override ground (7) or overstory classes.
+  has_dl <- "DownedLog" %in% names(ds)
+  if (has_dl && has_wc)
+    lbl[ds$DownedLog & ds$WoodLabel >= 2L] <- 4L
 
   lbl
 }
@@ -1713,6 +1734,59 @@ if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
   message(sprintf("[4] WoodCls done: %d / %d points classified as wood (%.1f%%).",
                   n_wood, nrow(wc_pts), 100 * n_wood / nrow(wc_pts)))
   rm(wc_pts, wc_bundle, wc_labels); invisible(gc())
+
+  # -- Downed log detection (Xi class 4) ------------------------------------
+  # Wood points near the ground (Z <= downed_z_max) whose local 3D neighbourhood
+  # has a predominantly horizontal primary axis are flagged as downed logs.
+  # Written to las@data$DownedLog (logical); compute_xi_label() reads it.
+  if (isTRUE(tls_params$downed_log_enable) &&
+      requireNamespace("RANN", quietly = TRUE)) {
+    dl_z_max  <- as.numeric(tls_params$downed_z_max)
+    dl_radius <- as.numeric(tls_params$downed_knn_radius)
+    dl_min_n  <- as.integer(tls_params$downed_knn_min_pts)
+    dl_tilt   <- as.numeric(tls_params$downed_tilt_min_deg)
+    # Candidate = non-ground wood point near ground
+    dl_cand <- which(las@data$WoodLabel >= 2L &
+                     las@data$Classification != 2L &
+                     las@data$Z <= dl_z_max)
+    las@data$DownedLog <- FALSE
+    if (length(dl_cand) > 0L) {
+      message(sprintf("[4] Downed log: PCA on %d near-ground wood candidates...",
+                      length(dl_cand)))
+      xyz_all  <- as.matrix(las@data[, c("X", "Y", "Z")])
+      xyz_cand <- xyz_all[dl_cand, , drop = FALSE]
+      # kNN within radius: search all points as reference, query candidates
+      nn_idx <- RANN::nn2(xyz_all, xyz_cand,
+                          k = min(50L, nrow(xyz_all)),
+                          searchtype = "radius",
+                          radius = dl_radius)$nn.idx
+      is_downed <- logical(length(dl_cand))
+      for (i in seq_along(dl_cand)) {
+        nbrs <- nn_idx[i, ]
+        nbrs <- nbrs[nbrs > 0L]
+        if (length(nbrs) < dl_min_n) next
+        nb_xyz <- xyz_all[nbrs, , drop = FALSE]
+        nb_xyz <- sweep(nb_xyz, 2L, colMeans(nb_xyz))
+        sv <- svd(nb_xyz, nu = 0L, nv = 1L)$v[, 1L]  # primary axis
+        # Angle between primary axis and vertical [0,0,1]
+        cos_a  <- abs(sv[3L]) / sqrt(sum(sv^2))
+        tilt_deg <- acos(pmin(1.0, cos_a)) * 180.0 / pi
+        is_downed[i] <- tilt_deg >= dl_tilt
+      }
+      las@data$DownedLog[dl_cand] <- is_downed
+      message(sprintf("[4] Downed log: %d / %d candidates flagged as downed (%.1f%%).",
+                      sum(is_downed), length(dl_cand),
+                      100 * mean(is_downed)))
+      rm(xyz_all, xyz_cand, nn_idx, is_downed, nb_xyz)
+    } else {
+      message("[4] Downed log: no near-ground wood candidates found.")
+    }
+    rm(dl_cand); invisible(gc())
+  } else if (!isTRUE(tls_params$downed_log_enable)) {
+    message("[4] Downed log detection skipped (downed_log_enable = FALSE).")
+  } else {
+    message("[4] Downed log detection skipped: RANN package not available.")
+  }
 
   # -- Understory StemCls pass ----------------------------------------------
   # Run the same StemCls model on understory points (TreeFilterLabel==1) so
