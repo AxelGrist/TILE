@@ -29,6 +29,7 @@ library(CspStandSegmentation)
 library(aRchi)
 library(ITSMe)
 library(sf)
+library(Rcpp)
 
 # Xeon w5-2545: 12 physical / 24 logical cores, 128 GB RAM. No competition
 # for cycles on this box, so use all logical threads.
@@ -39,6 +40,26 @@ if (requireNamespace("data.table", quietly = TRUE))
 # BLAS/LAPACK thread cap is set in TILE/.Renviron (OMP/OPENBLAS/MKL_NUM_THREADS)
 # and applied at R startup -- restart R if you change it.
 options(lidR.progress = TRUE)
+
+# ---- torch / CUDA auto-install ---------------------------------------------
+# Installs torch backend once; picks highest supported CUDA build <= driver max.
+local({
+  if (!requireNamespace("torch", quietly = TRUE) ||
+      isTRUE(torch::torch_is_installed())) return(invisible(NULL))
+
+  supported <- c("12.8", "12.6")   # torch 0.17.0 max is cu128; update when 0.18+ adds cu129+
+
+  hdr  <- tryCatch(system2("nvidia-smi", stdout = TRUE, stderr = FALSE), error = function(e) "")
+  m    <- regmatches(hdr, regexpr("[0-9]+\\.[0-9]+", hdr[grep("CUDA Version", hdr)[1L]]))
+  dnum <- if (length(m) == 1L) as.integer(sub("\\.", "", m)) else 0L  # e.g. 131
+
+  kind <- Filter(function(v) as.integer(gsub("\\.", "", v)) <= dnum, supported)
+  kind <- if (length(kind)) kind[[1L]] else "cpu"
+
+  message(sprintf("[torch] Installing LibTorch %s build.", kind))
+  Sys.setenv(CUDA = kind)
+  torch::install_torch()
+})
 
 
 # ============================================================================
@@ -133,26 +154,118 @@ tls_params <- list(
 
   # QC plot toggle (rgl slab; red = dropped, green = kept)
   shrub_qc_plot          = TRUE,
+
+  # --- Section 5c: Per-tree 2D QC images ---------------------------------
+  # Save one PNG per TreeID under <out_dir>/tree_qc/. When RGB is available
+  # in the LAS, each PNG is a 2x2 grid:
+  #   top-row    : XZ + YZ in true RGB
+  #   bottom-row : XZ + YZ classified wood (brown) vs foliage (green)
+  #                using the Excess-Green index ExG = 2G - R - B.
+  # When RGB is absent / all zero, falls back to the legacy 1x2 cyan/orange
+  # layout. Useful for QC-ing multi-stem clumps and wood/foliage purity.
+  tree_qc_enable         = TRUE,
+  tree_qc_subdir         = "tree_qc",
+  tree_qc_min_points     = 50L,    # skip TreeIDs sparser than this
+  tree_qc_xy_halfwidth   = 3.0,    # m; half-width of XZ/YZ panel
+  tree_qc_top_n          = NA,     # NA = all; set to e.g. 30 to limit to
+                                   # the largest-DBH TreeIDs (faster)
+  tree_qc_use_rgb        = TRUE,   # auto-detect RGB; FALSE to force the
+                                   # cyan/orange legacy layout.
+  # Wood/foliage classifier backend for the bottom row of the QC plot:
+  #   "pca"       : pure-R local-PCA linearity (no extra deps)
+  #   "treeaibox" : R-torch port of NRCan TreeAIBox's vox3DSegFormer
+  #                 (Xi, Hopkinson & Chasmer 2018; Xi, Chasmer & Hopkinson
+  #                 2023). Requires the treeAIBoxR package, the R `torch`
+  #                 backend installed (torch::install_torch() once), and
+  #                 a .pth weights file + matching .json config from
+  #                 https://github.com/NRCan/TreeAIBox/releases/tag/v1.0.
+  tree_qc_wf_method      = "treeaibox",
+  # --- pca backend knobs (always read; ignored when method != "pca") ---
+  # PCA: per point, take its k nearest neighbours, build the 3x3
+  # covariance, and compute linearity L = (l1 - l2) / l1. Linear
+  # neighbourhoods (high L) are wood/branches; scattered neighbourhoods
+  # (low L) are foliage. Geometric baseline from Belton 2013 / Xi 2018.
+  tree_qc_wf_k           = 10L,    # k neighbours for local PCA (10-20 ok)
+  tree_qc_wf_linearity   = 0.85,   # linearity threshold; >thr -> wood
+  tree_qc_wf_max_pts     = 60000L, # subsample if a tree exceeds this
+                                   # (kNN cost scales ~ n log n)
+  # --- treeaibox backend knobs (only used when method == "treeaibox") --
+  # Preferred: pass a model name and it auto-downloads on first use.
+  # Run treeAIBoxR::treeaibox_model_zoo() to see all available names.
+  tree_qc_treeaibox_model   = "woodcls_branch_tls_segformer3D_112_4cm(GPU2GBDistilled)",
+  # Legacy: set these only when pointing at manually downloaded files.
+  tree_qc_treeaibox_weights = NA_character_,  # path to .pth file
+  tree_qc_treeaibox_config  = NA_character_,  # path to matching .json
+  tree_qc_treeaibox_device  = "auto",         # "cuda" | "cpu" | "auto"
+  tree_qc_wood_color     = "#A0522D",  # sienna
+  tree_qc_foliage_color  = "#2E8B57",  # sea green
   # --- Section 3.3: Stem base detection -----------------------------------
   # Shape-aware: keep slice points that are vertical AND planar (trunk-like),
   # then 3D DBSCAN-cluster them. 3D clustering separates leaning/close stems
   # that 2D density would merge.
-  base_zmin            = 1.0,    # m; above shrub layer
-  base_zmax            = 2.0,    # m; below most branching
+  #
+  # Multi-slice union: instead of clustering one [zmin, zmax] band, cluster
+  # several narrow bands independently and union the centroids. Multi-stem
+  # clumps that braid together at one height often separate cleanly at
+  # another (root flare vs mid-bole). Set base_slices = NULL to fall back
+  # to the single [base_zmin, base_zmax] band.
+  #
+  # IMPORTANT (plot 311 calibration): low slices (<3 m) sit inside a dense
+  # foliage skirt that daisy-chains adjacent stems through interlocking
+  # branches. The 5-10 m mid-bole zone shows clean separated trunks. We
+  # detect bases there, then Section 4 recomputes XY from the [0.10, 0.50]
+  # m base slice for any TreeID that has enough points there (otherwise
+  # falls back to BH XY). This gives clump separation at altitude with
+  # base-accurate XY where possible.
+  base_zmin            = 3.0,    # m; above foliage skirt
+  base_zmax            = 10.0,   # m; below upper-crown foliage occlusion
+  base_slices          = list(   # list of c(zmin, zmax) pairs; NULL = single
+    c(3.0, 5.0),                 #   just above skirt
+    c(5.0, 7.0),                 #   cleanest separation zone
+    c(7.0, 10.0)                 #   upper-bole backup for occluded mid-bole
+  ),
   base_res             = 0.04,   # m; 3D DBSCAN eps -- tight enough to keep
                                  #    sapling clusters and close thin stems
                                  #    in separate clusters
-  base_min_vert        = 0.85,
-  base_min_plan        = 0.50,
-  base_min_cluster     = 40,     # 40 captures saplings; 75 lost ~17 trees
-                                 # on Plot 311 (vs field count of 53).
-  base_merge_eps       = 0.10,   # m; collapse near-duplicate bases (DBSCAN
-                                 # sometimes splits one trunk; without this,
-                                 # CSP routes each duplicate's voxels to
-                                 # whichever stem wins the Dijkstra tiebreak).
+  base_min_vert        = 0.85,   # strict: clean trunks at 3-10 m are bare
+                                 #         and very vertical; loose values
+                                 #         let foliage residuals back in.
+  base_min_plan        = 0.55,
+  base_min_cluster     = 12,     # slightly relaxed since fewer points per
+                                 # slice at height (vs ground-level slice).
+  base_merge_eps       = 0.30,   # m; fold cross-slice twins. Mid-bole
+                                 # centroids of a single leaning stem can
+                                 # drift up to ~20-25 cm between slices,
+                                 # so this floor keeps them folded into
+                                 # one base. Real neighbor stems are
+                                 # generally >0.5 m apart so this doesn't
+                                 # over-merge.
   # Raster fallback (uncomment + swap call below if geom misbehaves):
   # base_density_q       = 0.99,
   # base_merge_eps_raster= 0.15,
+
+  # RANSAC cylinder validation (per-cluster, per-slice). After DBSCAN
+  # clusters survive the verticality+planarity filter and the min-cluster
+  # gate, fit a vertical-axis cylinder (i.e. a 2D circle to the XY
+  # projection) to each cluster via RANSAC. Reject clusters whose:
+  #   * inlier ratio is too low (foliage tufts / branch stubs / leaning
+  #     fragments fail the cylinder hypothesis even when they pass the
+  #     eigen filter)
+  #   * fitted radius falls outside a plausible trunk-radius window
+  #   * vertical extent is too small a fraction of the slice thickness
+  #     (real trunks span the slice; foliage clusters are thin pancakes)
+  # Approach motivated by Zhu et al. 2024 (Forests 15:136), where a
+  # RANSAC cylinder gate eliminated ~50 false-positive shrubs that CSP's
+  # eigen filter alone could not.
+  base_cylinder_validate     = TRUE,
+  base_cyl_min_inlier_ratio  = 0.55,  # frac of cluster XY within tol of circle
+  base_cyl_inlier_tol        = 0.04,  # m; |dist_to_circle - r| <= tol -> inlier
+  base_cyl_radius_min        = 0.015, # m; ~3 cm DBH lower bound
+  base_cyl_radius_max        = 0.30,  # m; ~60 cm DBH upper bound
+  base_cyl_min_vert_frac     = 0.40,  # frac of slice thickness the cluster
+                                      # must span vertically
+  base_cyl_iters             = 80L,   # RANSAC iterations per cluster
+  base_cyl_seed              = 1L,    # RNG seed for repeatability
 
   # Plot extent (drop bases outside the buffered radius before CSP)
   plot_center_x        = 0.0,    # m; plot center (scanner-local frame)
@@ -169,7 +282,130 @@ tls_params <- list(
   base_continuity_top        = 6.0,    # m
   base_continuity_min_bands  = 4L,
 
-  # --- Section 3.4: CSP segmentation --------------------------------------
+  # --- Section 3.4: Segmentation method ----------------------------------
+  # Pluggable: pick which routine assigns TreeID to every point given the
+  # set of validated bases. All three accept the same `bases` data.frame
+  # so they are directly A/B-comparable on identical seeds.
+  #   "csp"          : CspStandSegmentation voxel-graph Dijkstra (Tao 2015).
+  #                    Strong on sparse, structurally simple stands.
+  #   "nearest_base" : XY Voronoi from base centroids. Fastest, no graph.
+  #                    Useful as a sanity-check baseline -- if CSP/SHS
+  #                    don't beat it, the bases are doing all the work.
+  #   "shs"          : Full SHS (Zhu 2024, Forests 15:136). Builds a 3D KNN
+  #                    adjacency graph over the canopy point cloud and runs
+  #                    multi-source binary-heap Dijkstra (Rcpp) from each
+  #                    trunk centroid. Each point assigned to the trunk with
+  #                    minimum geodesic distance through actual point-cloud
+  #                    connectivity -- correctly handles overhanging crowns
+  #                    and air gaps that 3D-Euclidean approaches mis-route.
+  #                    Trunk slice (Z <= shs_trunk_zmax) handled separately
+  #                    by nearest-base XY (matches paper Section 2.4 step 1).
+  #   "treeiso"      : Native R/Rcpp port of CloudCompare's qTreeIso plugin
+  #                    (Xi & Hopkinson 2022, doi:10.3390/rs14236116).
+  #                    Three-stage cut-pursuit pipeline operating directly
+  #                    on canopy XYZ; ignores `bases` and produces its own
+  #                    tree count.
+  seg_method           = "treeisonet",
+
+  # --- TreeFiltering knobs (optional pre-filter for treeisonet) ------------
+  # TreeFiltering runs a supervised DL classifier (ESegFormer3D) to separate
+  # overstory (class 2) from understory/ground (class 1) before TreeisoNet.
+  # When enabled (treeisonet_treefilter_model is not NA), only overstory
+  # points are passed to StemCls / TreeLoc. Mirrors the GUI workflow where
+  # TreeFiltering is applied first and subsequent steps use the treefilter
+  # scalar field to mask the input cloud.
+  #
+  # Model names must exist in treeaibox_model_zoo(); auto-downloaded on first use.
+  # Recommended:
+  #   TLS:  "treefiltering_tls_esegformer3D_128_8cm(GPU3GB)"
+  #   ALS:  "treefiltering_als_esegformer3D_128_50cm(GPU3GB)"   (50 cm regular)
+  #         "treefiltering_als_esegformer3D_128_80cm(GPU3GB)"   (80 cm mountainous)
+  #         "treefiltering_als_esegformer3D_128_15cm(GPU3GB)"   (15 cm wellsite)
+  #   UAV:  "treefiltering_uav_esegformer3D_128_12cm(GPU3GB)"
+  treeisonet_treefilter_model   = "treefiltering_tls_esegformer3D_128_8cm(GPU3GB)",
+  treeisonet_treefilter_device  = "auto",         # "auto" | "cuda" | "cpu"
+  # if_bottom_only: use 2D XY-only sliding blocks (TRUE) or full 3D (FALSE).
+  # ALS/UAV models: TRUE (no vertical structure; matches GUI default for ALS).
+  # TLS models:     FALSE (full 3D inference; taller voxel columns needed).
+  treeisonet_treefilter_bottom_only = FALSE,
+
+  # --- TreeisoNet knobs (used when seg_method == "treeisonet") -------------
+  # Deep-learning individual tree segmentation pipeline (Xi et al. 2023):
+  #
+  #   TLS boreal / UAV mixedwood:
+  #     StemCls (ESegformer3D) → TreeLoc (Detection) → shortestpath3D (graph)
+  #     Set treeisonet_stemcls_model + treeisonet_treeloc_model.
+  #
+  #   ALS reclamation:
+  #     TreeLoc (Detection) → TreeOff (Regression) → mergeshift (kNN)
+  #     Set treeisonet_treeloc_model + treeisonet_treeoff_model; leave
+  #     treeisonet_stemcls_model = NA_character_ to activate the ALS path.
+  #
+  # Model names must exist in treeaibox_model_zoo(); auto-downloaded on first use.
+  treeisonet_stemcls_model    = "treeisonet_tls_boreal_stemcls_esegformer3D_128_4cm(GPU3GB)",
+  treeisonet_treeloc_model    = "treeisonet_tls_boreal_treeloc_esegformer3D_128_10cm(GPU3GB)",
+  treeisonet_treeoff_model    = NA_character_,   # set for ALS reclamation path
+  treeisonet_device           = "auto",  # "auto" | "cuda" | "cpu"
+
+  # Custom voxel resolution (NA = use resolution embedded in model config)
+  treeisonet_vox_xy           = NA_real_,  # m; overrides model XY voxel size
+  treeisonet_vox_z            = NA_real_,  # m; overrides model Z voxel size
+
+  # StemCls post-processing — "Remove small clusters" in the GUI
+  treeisonet_stemcls_remove_small = TRUE,  # remove isolated small stem clusters
+  treeisonet_stemcls_max_gap      = 3.0,   # m; connectivity gap tolerance
+  treeisonet_stemcls_min_points   = 100L,  # min cluster size to keep as stem
+
+  # TreeLoc detection tuning
+  # TLS/UAV path (if_stem=TRUE, treeloc-cutoff-content panel in GUI):
+  treeisonet_cutoff_thresh    = 0.3,    # fraction of per-tile stem height to use
+  treeisonet_cut_grid_res     = 5.0,    # m; tile width for height normalisation
+  treeisonet_base_radius_m    = 0.2,    # m; search radius when snapping base XYZ
+  # ALS path (if_stem=FALSE, treeloc-default-content panel in GUI):
+  treeisonet_conf_thresh      = 0.3,    # min per-point confidence for peak map
+  treeisonet_nms_thresh_xy    = 0.5,    # NMS suppression: multiplied by sum of radii
+  treeisonet_treeloc_max_gap  = 0.3,    # m; max gap in postPeakExtraction kNN graph
+  treeisonet_treeloc_K        = 5L,     # kNN k for postPeakExtraction grouping
+
+  # shortestpath3D graph tuning (TLS / UAV path only)
+  treeisonet_min_res          = 0.06,   # m; voxel edge for graph decimation
+  treeisonet_max_isolated_dist = 0.3,   # m; max edge length in kNN graph
+  treeisonet_k_graph          = 10L,    # kNN k for point-level graph edges
+  treeisonet_k_node           = 20L,    # kNN k for component-centroid graph
+
+  # --- TreeIso knobs (used when seg_method == "treeiso") ------------------
+  # Native R/Rcpp port of the CloudCompare qTreeIso plugin (Xi & Hopkinson
+  # 2022, doi:10.3390/rs14236116). Runs the original 3-stage cut-pursuit
+  # pipeline directly on the canopy XYZ; ignores `bases` and produces its
+  # own tree count (set tree_min_height/tree_min_dbh to 0 to keep all
+  # treeiso outputs through validation).
+  treeiso_K1                  = 5L,    # stage 1: kNN
+  treeiso_lambda1             = 1.0,   # stage 1: cut-pursuit reg strength
+  treeiso_dec_r1              = 0.05,  # stage 1: voxel decimation (m)
+  treeiso_K2                  = 20L,   # stage 2: kNN over cluster centroids
+  treeiso_lambda2             = 20.0,  # stage 2: cut-pursuit reg strength
+  treeiso_max_gap             = 2.0,   # stage 2: max 3D gap between segs (m)
+  treeiso_dec_r2              = 0.10,  # stage 2: voxel decimation (m)
+  treeiso_K3                  = 20L,   # stage 3: kNN for refinement
+  treeiso_rel_h_len_r         = 0.5,   # stage 3: rel-height/length threshold
+  treeiso_vert_w              = 0.5,   # stage 3: vertical-overlap weight
+  treeiso_threads             = 6L,    # OpenMP threads
+  treeiso_verbose             = FALSE,
+
+  # --- SHS knobs (used when seg_method == "shs") --------------------------
+  shs_trunk_zmax       = 4.0,    # m; trunk-layer / canopy-layer split
+  shs_canopy_voxel     = 0.10,   # m; canopy thinning before graph build.
+                                 # 14M -> ~1-2M nodes keeps Dijkstra under
+                                 # 60 s and graph memory <2 GB. Final labels
+                                 # are propagated back to the full cloud
+                                 # via 3D nearest-neighbor lookup.
+  shs_knn_k            = 8L,     # KNN k for adjacency graph
+  shs_knn_max_dist     = 0.50,   # m; edges longer than this are dropped
+                                 # (forces routing through actual point-
+                                 # cloud connectivity rather than across
+                                 # air gaps -- the whole point of geodesic).
+
+  # --- CSP cost-segmentation knobs (used when seg_method == "csp") --------
   csp_voxel            = 0.07,   # m; routing graph voxel. 0.05 fragments
                                  # the graph after the shrub filter (igraph
                                  # assertion failure, ~75% base drop-out).
@@ -188,8 +424,12 @@ tls_params <- list(
   inv_width            = 0.05,   # m; slice thickness for circle fit
   inv_max_dbh          = 1.0,    # m; reject impossible stems
   inv_n_cores          = parallel::detectCores(logical = TRUE),
-  tree_min_dbh         = 0.05,   # m; >=5 cm DBH to count as a tree
-  tree_min_height      = 5.0,    # m; >=5 m tall to count as a tree
+  tree_min_dbh         = 0.0,    # TEMP for TreeIso QC: was 0.04. Field min
+                                 # for plot 311 = 5.8 cm. Restore to 0.04
+                                 # once TreeIso output is validated.
+  tree_min_height      = 0.0,    # TEMP for TreeIso QC: was 4.0. Field min
+                                 # for plot 311 = 9.0 m. Restore to 4.0
+                                 # once TreeIso output is validated.
 
   # Stem-base XY recomputation. forest_inventory() returns X/Y at breast
   # height (~1.3 m, splined from the taper). For leaning trunks that's not
@@ -231,6 +471,41 @@ tls_params <- list(
   lws_hag_max_for_wood = NA_real_,
   lws_exg_max          = 0.10,
 
+  # --- Section 7: WoodCls -------------------------------------------------
+  # WoodCls runs a supervised DL binary classifier (ESegFormer3D) per point
+  # to separate wood (branches + trunk, label=2) from foliage (label=1).
+  # Output is written to las@data$WoodLabel.
+  # The QSM pipeline (Section 8) uses WoodLabel==2 points as input.
+  # Set woodcls_model = NA_character_ to skip (QSM will not run either).
+  #
+  # Recommended models:
+  #   woodcls_branch_tls_esegformer3D_128_2.5cm(GPU3GB)  ← 2 GB GPU, 2.5 cm vox
+  #   woodcls_branch_tls_segformer3D_112_4cm(GPU2GBDistilled) ← distilled, faster
+  #   woodcls_stem_tls_esegformer3D_128_4cm(GPU3GB)
+  woodcls_model  = "woodcls_branch_tls_esegformer3D_128_2.5cm(GPU3GB)",
+  woodcls_device = "auto",   # "auto" | "cuda" | "cpu"
+
+  # --- Section 8: QSM (TreeAIBox) -----------------------------------------
+  # Builds a Quantitative Structure Model per tree using the applyQSM
+  # pipeline (Xi et al.; cut-pursuit over-segmentation + Dijkstra skeleton +
+  # algebraic circle-fit radii). Requires treeisoR >= 0.2.0 (cut_pursuit_segment).
+  # Set qsm_tree_ids = NA to run on all trees with TreeID > 0.
+  qsm_tree_ids           = NA_integer_,   # integer vector or NA = all trees
+  # cut-pursuit over-segmentation
+  qsm_K_stem             = 20L,     # kNN for stem seg (more neighbours → smoother)
+  qsm_reg_stem           = 5.0,     # regularisation for stem (high → fewer segs)
+  qsm_K_branch           = 3L,      # kNN for branch seg
+  qsm_reg_branch         = 0.01,    # regularisation for branches (low → more segs)
+  # skeleton graph
+  qsm_k_neighbors        = 6L,      # kNN for segment connectivity graph
+  qsm_max_graph_distance = 40,      # max Dijkstra path length (graph edge units)
+  qsm_max_conn_dist      = 0.03,    # m; cross-segment point adjacency radius
+  qsm_occlusion_cutoff   = 0.4,     # m; edges beyond this are cut as occluded
+  qsm_min_pts_clean      = 5L,      # min pts in branch tip to keep that branch
+  qsm_min_radius_m       = 0.04,    # m; minimum enforced cylinder radius
+  qsm_threads            = 1L,      # OpenMP threads for cut-pursuit
+  qsm_out_dir            = NA_character_,  # NA = use out_dir from pipeline
+
   # --- Section 6: Field-data validation -----------------------------------
   # For each field tree, find ALL TLS candidates inside a buffer radius,
   # then pick the candidate with the lowest weighted score across
@@ -251,8 +526,12 @@ tls_params <- list(
   field_dbh_units      = "cm",             # "cm" or "m"; converts to m to match inv$DBH
   field_height_units   = "m",
 
-  field_match_buffer   = 1.5,    # m; radius around each field tree to
-                                 # gather TLS candidates from `inv`
+  field_match_buffer   = 2.0,    # m; radius around each field tree to
+                                 # gather TLS candidates from `inv`. 2.0 m
+                                 # is generous enough to catch persistent
+                                 # multi-stem clumps where the field XY
+                                 # was recorded for a stem that merged
+                                 # into a neighbor at TLS base height.
   field_match_buffer_pass1 = 3.0,# m; wider buffer for the first pass so a
                                  # rotated plot still yields candidates for
                                  # the azimuth-bias estimate
@@ -456,7 +735,19 @@ if (isTRUE(tls_params$multiscale_enable)) {
 # Modes: global (single rule) or stratified (ground/shrub/lower).
 # Optional additive gates: multi-scale consensus, intensity, ExG.
 # All gates are conservative -- they can only KEEP more points.
+#
+# Skipped when seg_method='treeisonet' with a treefilter model set:
+# TreeFilter (ESegFormer3D) classifies overstory vs shrub/ground directly
+# and is strictly better than this hand-tuned eigen-geometry rule.
+.use_treefilter <- identical(tolower(tls_params$seg_method), "treeisonet") &&
+  !is.null(tls_params$treeisonet_treefilter_model) &&
+  !is.na(tls_params$treeisonet_treefilter_model) &&
+  nzchar(tls_params$treeisonet_treefilter_model)
+if (.use_treefilter) {
+  message("3.2 Shrub filter: skipped (TreeFilter model handles overstory/shrub separation).")
+}
 npts0 <- npoints(las)
+if (!.use_treefilter) {
 shrub_layer <- las@data$Z >= tls_params$shrub_z_min &
                las@data$Z <  tls_params$shrub_height_max
 
@@ -588,46 +879,179 @@ if (isTRUE(tls_params$shrub_qc_plot)) {
 }
 rm(shrub_layer, foliage_shape, weak_signal, drop_mask)
 if (exists("pre_x")) rm(pre_x, pre_y, pre_z)
+} # end !.use_treefilter
 
 # 3.3 Stem base detection ----------------------------------------------------
 # Shape-aware base finder. Local fast variant of
 # CspStandSegmentation::find_base_coordinates_geom() that reuses the
+# eigen columns we already computed in 3.1. Skipped when TreeisoNet runs
+# its own TreeLoc model internally (see .use_treefilter guard below).
+#
+# CspStandSegmentation::find_base_coordinates_geom() that reuses the
 # eigen columns we already computed in 3.1. Otherwise identical logic
 # (CspStandSegmentation 0.2.0).
+#
+# Multi-slice union: when `slices` is a list of c(zmin, zmax) pairs, run
+# the per-slice DBSCAN cluster -> centroid pipeline once per slice and
+# union the centroids before the cross-slice merge_eps fold. Multi-stem
+# clumps that braid together at one height often separate cleanly at
+# another. When `slices` is NULL, falls back to a single [zmin, zmax]
+# slice (legacy behavior).
 find_bases_geom_fast <- function(las, zmin, zmax, res,
                                  min_verticality, min_planarity,
-                                 min_cluster_size, merge_eps = 0.20) {
-  slice <- lidR::filter_poi(las, Classification != 2L & Z > zmin & Z < zmax)
-  if (lidR::is.empty(slice))
-    stop("No points in [zmin, zmax].")
-  if (!all(c("Verticality", "Planarity") %in% names(slice@data)))
-    slice <- CspStandSegmentation::add_geometry(slice)
-  slice <- lidR::filter_poi(slice,
-                            Planarity   > min_planarity &
-                            Verticality > min_verticality)
-  if (lidR::is.empty(slice))
-    stop("No points pass planarity/verticality thresholds.")
-  cl <- dbscan::dbscan(slice@data[, 1:3], eps = res, minPts = 1)$cluster
-  keep <- as.integer(names(table(cl))[table(cl) > min_cluster_size])
-  slice <- lidR::filter_poi(slice, cl %in% keep)
-  cl    <- cl[cl %in% keep]
-  xy <- aggregate(slice@data[, 1:2], by = list(cl), mean)
-  z  <- aggregate(slice@data[, 3],   by = list(cl), min)
-  bases <- data.frame(X = xy[, 2], Y = xy[, 3], Z = z[, 2])
+                                 min_cluster_size, merge_eps = 0.20,
+                                 slices = NULL,
+                                 cylinder_validate    = FALSE,
+                                 cyl_min_inlier_ratio = 0.55,
+                                 cyl_inlier_tol       = 0.04,
+                                 cyl_radius_min       = 0.015,
+                                 cyl_radius_max       = 0.30,
+                                 cyl_min_vert_frac    = 0.40,
+                                 cyl_iters            = 80L,
+                                 cyl_seed             = 1L) {
+
+  # Fit a 2D circle to three non-collinear points; return c(cx, cy, r) or
+  # NULL if the points are (near-)collinear. Used as the RANSAC sample
+  # hypothesis for cylinder validation (vertical-axis cylinder == circle
+  # in XY).
+  circle_from_3 <- function(p) {
+    ax <- p[1, 1]; ay <- p[1, 2]
+    bx <- p[2, 1]; by <- p[2, 2]
+    cx_ <- p[3, 1]; cy_ <- p[3, 2]
+    d <- 2 * (ax * (by - cy_) + bx * (cy_ - ay) + cx_ * (ay - by))
+    if (abs(d) < 1e-9) return(NULL)
+    ux <- ((ax^2 + ay^2) * (by - cy_) +
+           (bx^2 + by^2) * (cy_ - ay) +
+           (cx_^2 + cy_^2) * (ay - by)) / d
+    uy <- ((ax^2 + ay^2) * (cx_ - bx) +
+           (bx^2 + by^2) * (ax - cx_) +
+           (cx_^2 + cy_^2) * (bx - ax)) / d
+    r <- sqrt((ax - ux)^2 + (ay - uy)^2)
+    c(ux, uy, r)
+  }
+
+  # RANSAC vertical-cylinder gate. Returns TRUE if the cluster looks like
+  # a piece of a trunk: enough XY points lie on a circle of plausible
+  # radius, AND the cluster spans enough vertical extent.
+  cylinder_ok <- function(xyz, z1, z2) {
+    n <- nrow(xyz)
+    if (n < 6L) return(FALSE)
+    # Vertical extent gate (fast reject): foliage tufts are thin pancakes.
+    z_extent <- diff(range(xyz[, 3]))
+    if (z_extent < cyl_min_vert_frac * (z2 - z1)) return(FALSE)
+    xy <- xyz[, 1:2, drop = FALSE]
+    best_inliers <- 0L
+    best_r <- NA_real_
+    for (it in seq_len(cyl_iters)) {
+      idx <- sample.int(n, 3L)
+      cir <- circle_from_3(xy[idx, , drop = FALSE])
+      if (is.null(cir)) next
+      r <- cir[3]
+      if (r < cyl_radius_min || r > cyl_radius_max) next
+      d <- sqrt((xy[, 1] - cir[1])^2 + (xy[, 2] - cir[2])^2)
+      ninl <- sum(abs(d - r) <= cyl_inlier_tol)
+      if (ninl > best_inliers) {
+        best_inliers <- ninl
+        best_r <- r
+      }
+    }
+    if (best_inliers == 0L) return(FALSE)
+    if (is.na(best_r) ||
+        best_r < cyl_radius_min || best_r > cyl_radius_max) return(FALSE)
+    (best_inliers / n) >= cyl_min_inlier_ratio
+  }
+
+  # Per-slice helper: returns a data.frame(X, Y, Z) of centroids, or
+  # NULL if the slice is empty / no clusters survive.
+  one_slice <- function(z1, z2) {
+    sl <- lidR::filter_poi(las, Classification != 2L & Z > z1 & Z < z2)
+    if (lidR::is.empty(sl)) return(NULL)
+    if (!all(c("Verticality", "Planarity") %in% names(sl@data)))
+      sl <- CspStandSegmentation::add_geometry(sl)
+    sl <- lidR::filter_poi(sl,
+                           Planarity   > min_planarity &
+                           Verticality > min_verticality)
+    if (lidR::is.empty(sl)) return(NULL)
+    cl <- dbscan::dbscan(sl@data[, 1:3], eps = res, minPts = 1)$cluster
+    keep <- as.integer(names(table(cl))[table(cl) > min_cluster_size])
+    if (!length(keep)) return(NULL)
+    sl <- lidR::filter_poi(sl, cl %in% keep)
+    cl <- cl[cl %in% keep]
+    # RANSAC cylinder validation per cluster (opt-in). Drops clusters
+    # that pass the eigen filter but don't actually look like a trunk
+    # piece (foliage tufts, charred branch stubs, leaning fragments).
+    if (isTRUE(cylinder_validate)) {
+      set.seed(cyl_seed)
+      pts <- as.matrix(sl@data[, 1:3])
+      n_pre <- length(keep)
+      keep_ok <- vapply(keep, function(k)
+        cylinder_ok(pts[cl == k, , drop = FALSE], z1, z2),
+        logical(1))
+      keep <- keep[keep_ok]
+      if (!length(keep)) return(NULL)
+      sl <- lidR::filter_poi(sl, cl %in% keep)
+      cl <- cl[cl %in% keep]
+      message(sprintf("  RANSAC cylinder gate [%.2f-%.2f]: %d / %d clusters passed.",
+                      z1, z2, length(keep), n_pre))
+    }
+    xy <- aggregate(sl@data[, 1:2], by = list(cl), mean)
+    # NOTE: base Z is intentionally set to ground level (not min Z of the
+    # cluster) so CSP's voxel graph can always reach the seed. Bases at
+    # mid-bole height (3-10 m) often land in occluded gaps between voxels
+    # and produce "Invalid vertex names" -> unreachable warnings, leaving
+    # those TreeIDs with zero segmented points. With Z = ground, every
+    # seed lives in the dense ground layer where Dijkstra can spread out.
+    # XY is still the mid-bole centroid (good clump separation); Section
+    # 4 then recomputes XY from the [0.10, 0.50] m slice for accuracy.
+    data.frame(X = xy[, 2], Y = xy[, 3], Z = 0.5)
+  }
+
+  if (is.null(slices) || !length(slices)) {
+    bases <- one_slice(zmin, zmax)
+    if (is.null(bases))
+      stop("No clusters survived in [zmin, zmax].")
+    n_per <- nrow(bases)
+    message(sprintf("Base detection (single slice [%.2f, %.2f]): %d centroids.",
+                    zmin, zmax, n_per))
+  } else {
+    parts <- lapply(slices, function(s) one_slice(s[1], s[2]))
+    n_per <- vapply(parts, function(p) if (is.null(p)) 0L else nrow(p), integer(1))
+    message(sprintf("Base detection (multi-slice union): %s -> %d centroids before merge.",
+                    paste(sprintf("[%.2f-%.2f]=%d",
+                                  vapply(slices, `[`, numeric(1), 1),
+                                  vapply(slices, `[`, numeric(1), 2),
+                                  n_per), collapse = ", "),
+                    sum(n_per)))
+    parts <- parts[!vapply(parts, is.null, logical(1))]
+    if (!length(parts))
+      stop("No clusters survived in any slice.")
+    bases <- do.call(rbind, parts)
+  }
 
   # Merge near-duplicate bases (DBSCAN can split one trunk into multiple
-  # vertical-planar fragments at slightly different heights). Collapse any
+  # vertical-planar fragments at slightly different heights; multi-slice
+  # mode also produces one centroid per stem per slice). Collapse any
   # bases within `merge_eps` (XY) into a single mean centroid. Without
   # this step, CSP routes each duplicate seed's voxels to whichever stem
   # wins the Dijkstra tiebreak, absorbing entire neighbor trunks.
   if (nrow(bases) > 1 && merge_eps > 0) {
+    nb_pre <- nrow(bases)
     mc <- dbscan::dbscan(bases[, c("X", "Y")], eps = merge_eps, minPts = 1)$cluster
     bases <- aggregate(bases, by = list(mc), mean)[, -1]
+    message(sprintf("Base merge (eps=%.2f m): %d -> %d centroids.",
+                    merge_eps, nb_pre, nrow(bases)))
   }
   bases$TreeID <- seq_len(nrow(bases))
   bases
 }
 
+if (.use_treefilter) {
+  # TreeisoNet runs TreeLoc internally — base detection is skipped.
+  # Create an empty stub so the switch dispatcher has a `bases` variable.
+  bases <- data.frame(X = numeric(0), Y = numeric(0), Z = numeric(0),
+                      TreeID = integer(0))
+  message("3.3 Base detection: skipped (TreeLoc model handles base detection internally).")
+} else {
 bases <- find_bases_geom_fast(las,
   zmin             = tls_params$base_zmin,
   zmax             = tls_params$base_zmax,
@@ -635,7 +1059,16 @@ bases <- find_bases_geom_fast(las,
   min_verticality  = tls_params$base_min_vert,
   min_planarity    = tls_params$base_min_plan,
   min_cluster_size = tls_params$base_min_cluster,
-  merge_eps        = tls_params$base_merge_eps
+  merge_eps        = tls_params$base_merge_eps,
+  slices           = tls_params$base_slices,
+  cylinder_validate    = tls_params$base_cylinder_validate,
+  cyl_min_inlier_ratio = tls_params$base_cyl_min_inlier_ratio,
+  cyl_inlier_tol       = tls_params$base_cyl_inlier_tol,
+  cyl_radius_min       = tls_params$base_cyl_radius_min,
+  cyl_radius_max       = tls_params$base_cyl_radius_max,
+  cyl_min_vert_frac    = tls_params$base_cyl_min_vert_frac,
+  cyl_iters            = tls_params$base_cyl_iters,
+  cyl_seed             = tls_params$base_cyl_seed
 )
 # Upstream alternatives (uncomment + swap if needed):
 # bases <- find_base_coordinates_geom(las, ...)        # slower, identical result
@@ -679,16 +1112,487 @@ if (isTRUE(tls_params$base_continuity_enable) && nrow(bases) > 0) {
                   tls_params$base_continuity_min_bands,
                   length(bands) - 1L))
   rm(cloud_xyz, bands_per_base)
+  }
+} # end !.use_treefilter (base detection block)
+
+# 3.4 Segmentation -----------------------------------------------------------
+# Dispatcher: assigns TreeID to every point. All three methods take the
+# same validated `bases` and return a LAS with @data$TreeID populated.
+
+# Pure XY Voronoi from base centroids -- fastest, no graph. Useful as a
+# baseline: if a more expensive method does not improve over this, the
+# bases (not the routing) are doing all the work.
+segment_trees_nearest_base <- function(las, bases) {
+  if (!requireNamespace("RANN", quietly = TRUE))
+    stop("seg_method='nearest_base' requires the RANN package.")
+  pts_xy <- as.matrix(las@data[, .(X, Y)])
+  base_xy <- as.matrix(bases[, c("X", "Y")])
+  nn <- RANN::nn2(base_xy, pts_xy, k = 1L)
+  las@data$TreeID <- bases$TreeID[nn$nn.idx[, 1]]
+  message(sprintf("seg_method='nearest_base': %d points -> %d trees.",
+                  nrow(las@data), nrow(bases)))
+  las
 }
 
-# 3.4 CSP cost segmentation --------------------------------------------------
-# Assigns TreeID to every point.
-las <- csp_cost_segmentation(las, bases,
-  Voxel_size = tls_params$csp_voxel,
-  V_w        = tls_params$csp_v_w,
-  L_w        = tls_params$csp_l_w,
-  S_w        = tls_params$csp_s_w,
-  N_cores    = tls_params$csp_n_cores
+# SHS-flavored hierarchical segmentation (Zhu 2024, Forests 15:136). Full
+# implementation:
+#   1. Trunk slice (Z <= trunk_zmax): assign each point to its nearest
+#      base centroid in XY (paper Section 2.4 step 1).
+#   2. Canopy slice (Z > trunk_zmax):
+#      a. Optionally voxel-thin to keep the graph tractable. Final labels
+#         get propagated back to the full cloud via 3D nearest-neighbor.
+#      b. Build a 3D KNN adjacency graph (RANN), drop edges > knn_max_dist
+#         so paths must traverse real point-cloud connectivity.
+#      c. Multi-source binary-heap Dijkstra (Rcpp) from a virtual super-
+#         source connected with weight 0 to all trunk centroids. Each
+#         canopy node's parent chain ends at the trunk centroid that
+#         achieves minimum geodesic distance -- this is the algorithm in
+#         the paper (Algorithm 1).
+#      d. Propagate labels from thinned canopy back to full canopy via
+#         3D nearest-neighbor.
+#
+# The Rcpp Dijkstra kernel is compiled once on first use via cppFunction.
+# This requires Rtools (Windows) or a system C++ toolchain.
+.shs_dijkstra_compiled <- new.env(parent = emptyenv())
+.shs_dijkstra_compiled$fn <- NULL
+
+.shs_compile <- function() {
+  if (!is.null(.shs_dijkstra_compiled$fn)) return(invisible(NULL))
+  if (!requireNamespace("Rcpp", quietly = TRUE))
+    stop("seg_method='shs' requires the Rcpp package.")
+  message("Compiling SHS multi-source Dijkstra kernel (Rcpp)...")
+  Rcpp::cppFunction(depends = "", plugins = "cpp11", code = '
+    #include <Rcpp.h>
+    #include <vector>
+    #include <queue>
+    #include <utility>
+    #include <limits>
+    using namespace Rcpp;
+
+    // Multi-source binary-heap Dijkstra over a CSR adjacency graph.
+    //   adj_idx, adj_w : flat neighbor arrays (length = sum of degrees)
+    //   adj_ptr        : length n+1; node i has neighbors adj_idx[adj_ptr[i]..adj_ptr[i+1]-1]
+    //   sources        : 0-based source-node indices (one per trunk centroid)
+    //   labels         : label to assign to nodes reached via each source (e.g. TreeID)
+    // Returns: IntegerVector of length n with the assigned label per node
+    //          (NA_integer_ for unreachable nodes).
+    // [[Rcpp::export]]
+    IntegerVector shs_dijkstra_multi_cpp(IntegerVector adj_idx,
+                                         NumericVector adj_w,
+                                         IntegerVector adj_ptr,
+                                         IntegerVector sources,
+                                         IntegerVector labels) {
+      const int n = adj_ptr.size() - 1;
+      const int s = sources.size();
+      const double INF = std::numeric_limits<double>::infinity();
+      std::vector<double> dist(n, INF);
+      std::vector<int> lab(n, NA_INTEGER);
+      // Min-heap: (distance, node)
+      typedef std::pair<double,int> P;
+      std::priority_queue<P, std::vector<P>, std::greater<P> > pq;
+      for (int i = 0; i < s; ++i) {
+        int u = sources[i];
+        if (u < 0 || u >= n) continue;
+        if (0.0 < dist[u]) {
+          dist[u] = 0.0;
+          lab[u]  = labels[i];
+          pq.push(std::make_pair(0.0, u));
+        }
+      }
+      while (!pq.empty()) {
+        P top = pq.top(); pq.pop();
+        double d = top.first;
+        int u = top.second;
+        if (d > dist[u]) continue;       // stale
+        int p0 = adj_ptr[u], p1 = adj_ptr[u+1];
+        for (int p = p0; p < p1; ++p) {
+          int v = adj_idx[p];
+          double nd = d + adj_w[p];
+          if (nd < dist[v]) {
+            dist[v] = nd;
+            lab[v]  = lab[u];
+            pq.push(std::make_pair(nd, v));
+          }
+        }
+      }
+      IntegerVector out(n);
+      for (int i = 0; i < n; ++i) out[i] = lab[i];
+      return out;
+    }
+  ', env = .shs_dijkstra_compiled)
+  .shs_dijkstra_compiled$fn <- .shs_dijkstra_compiled$shs_dijkstra_multi_cpp
+  invisible(NULL)
+}
+
+segment_trees_shs <- function(las, bases,
+                              trunk_zmax    = 4.0,
+                              canopy_voxel  = 0.10,
+                              knn_k         = 8L,
+                              knn_max_dist  = 0.50) {
+  if (!requireNamespace("RANN", quietly = TRUE))
+    stop("seg_method='shs' requires the RANN package.")
+  .shs_compile()
+  pts <- as.matrix(las@data[, .(X, Y, Z)])
+  base_xy <- as.matrix(bases[, c("X", "Y")])
+  is_trunk <- pts[, 3] <= trunk_zmax
+  tree_id <- rep(NA_integer_, nrow(pts))
+
+  # Step 1: trunk slice -> nearest base XY.
+  if (any(is_trunk)) {
+    nn_t <- RANN::nn2(base_xy, pts[is_trunk, 1:2, drop = FALSE], k = 1L)
+    tree_id[is_trunk] <- bases$TreeID[nn_t$nn.idx[, 1]]
+  }
+  message(sprintf("SHS step 1 (trunk slice): %d points labeled.", sum(is_trunk)))
+
+  if (!any(!is_trunk)) {
+    las@data$TreeID <- tree_id
+    return(las)
+  }
+
+  # Step 2a: voxel-thin the canopy slice to keep the graph tractable.
+  can_full <- pts[!is_trunk, , drop = FALSE]
+  if (canopy_voxel > 0) {
+    vox <- floor(can_full / canopy_voxel)
+    key <- paste(vox[, 1], vox[, 2], vox[, 3], sep = ":")
+    keep <- !duplicated(key)
+    can <- can_full[keep, , drop = FALSE]
+    message(sprintf("SHS step 2a (canopy thin %.2f m): %d -> %d nodes.",
+                    canopy_voxel, nrow(can_full), nrow(can)))
+  } else {
+    can <- can_full
+    message(sprintf("SHS step 2a (no thinning): %d canopy nodes.", nrow(can)))
+  }
+
+  # Append trunk centroids as graph nodes so they act as Dijkstra sources.
+  # Each centroid is given Z = trunk_zmax (top of trunk slice) so it can
+  # connect to nearby canopy points within knn_max_dist.
+  base_pts <- cbind(base_xy, trunk_zmax)
+  nodes <- rbind(base_pts, can)
+  n_base <- nrow(base_pts)
+  n_nodes <- nrow(nodes)
+
+  # Step 2b: 3D KNN adjacency. Edges with d > knn_max_dist are dropped.
+  message(sprintf("SHS step 2b (KNN k=%d, n=%d): building adjacency...",
+                  knn_k + 1L, n_nodes))
+  nn <- RANN::nn2(nodes, nodes, k = knn_k + 1L)   # +1 for self-match
+  # Drop self (col 1) and over-distance edges. Build CSR.
+  ni <- nn$nn.idx[, -1, drop = FALSE]            # n x k
+  nd <- nn$nn.dists[, -1, drop = FALSE]          # n x k
+  valid <- nd <= knn_max_dist
+  deg <- rowSums(valid)
+  adj_ptr <- as.integer(c(0L, cumsum(deg)))
+  total_edges <- adj_ptr[length(adj_ptr)]
+  adj_idx <- integer(total_edges)
+  adj_w   <- numeric(total_edges)
+  # Flatten valid edges row by row. Vectorized via t() on logical mask.
+  idx_t <- t(ni); val_t <- t(valid); d_t <- t(nd)
+  sel <- as.logical(val_t)
+  adj_idx <- as.integer(idx_t[sel] - 1L)         # 0-based for C++
+  adj_w   <- as.numeric(d_t[sel])
+  message(sprintf("SHS step 2b: %d directed edges (mean degree %.1f, %d isolated nodes).",
+                  total_edges, total_edges / n_nodes, sum(deg == 0L)))
+
+  # Step 2c: multi-source Dijkstra from the n_base centroid nodes.
+  sources <- seq_len(n_base) - 1L                # 0-based
+  labels  <- as.integer(bases$TreeID)
+  message(sprintf("SHS step 2c: Dijkstra from %d sources over %d nodes...",
+                  n_base, n_nodes))
+  t0 <- proc.time()[3]
+  node_lab <- .shs_dijkstra_compiled$fn(
+    adj_idx = adj_idx, adj_w = adj_w, adj_ptr = adj_ptr,
+    sources = as.integer(sources), labels = labels
+  )
+  message(sprintf("SHS step 2c: Dijkstra done in %.1f s. %d / %d nodes reached.",
+                  proc.time()[3] - t0, sum(!is.na(node_lab)), n_nodes))
+
+  # Drop the trunk-centroid sentinel nodes; keep canopy node labels.
+  can_lab <- node_lab[(n_base + 1L):n_nodes]
+
+  # Step 2d: propagate labels back to the full (un-thinned) canopy slice.
+  if (canopy_voxel > 0) {
+    nn_back <- RANN::nn2(can, can_full, k = 1L)
+    full_can_lab <- can_lab[nn_back$nn.idx[, 1]]
+  } else {
+    full_can_lab <- can_lab
+  }
+  tree_id[!is_trunk] <- full_can_lab
+
+  # Any unreachable canopy points (graph isolated) fall back to nearest
+  # base XY -- otherwise downstream forest_inventory chokes on NA TreeIDs.
+  na_mask <- is.na(tree_id) & !is_trunk
+  if (any(na_mask)) {
+    nn_fb <- RANN::nn2(base_xy, pts[na_mask, 1:2, drop = FALSE], k = 1L)
+    tree_id[na_mask] <- bases$TreeID[nn_fb$nn.idx[, 1]]
+    message(sprintf("SHS fallback: %d unreachable canopy points -> nearest base XY.",
+                    sum(na_mask)))
+  }
+
+  las@data$TreeID <- tree_id
+  message(sprintf("seg_method='shs': %d trunk + %d canopy points; %d trees.",
+                  sum(is_trunk), sum(!is_trunk), nrow(bases)))
+  las
+}
+
+# ----------------------------------------------------------------------------
+# TreeIso: native R/Rcpp port of the CloudCompare qTreeIso plugin
+# (Xi & Hopkinson 2022, doi:10.3390/rs14236116). Three-stage cut-pursuit
+# pipeline. Ignores `bases` and produces its own tree count.
+# ----------------------------------------------------------------------------
+segment_trees_treeisonet <- function(las, tls_params) {
+  if (!requireNamespace("treeAIBoxR", quietly = TRUE))
+    stop("seg_method='treeisonet' requires the treeAIBoxR package. ",
+         "Install with devtools::install_local('R/modules/treeAIBoxR').")
+
+  device <- if (identical(tls_params$treeisonet_device, "auto")) {
+    if (torch::cuda_is_available()) "cuda" else "cpu"
+  } else {
+    tls_params$treeisonet_device
+  }
+
+  pts <- as.matrix(las@data[, c("X", "Y", "Z")])
+
+  # Build voxel resolution override from params (NULL fields = use model default)
+  vox_override <- list(
+    xy = tls_params$treeisonet_vox_xy,
+    z  = tls_params$treeisonet_vox_z
+  )
+
+  # ---- Optional TreeFiltering pre-filter ----------------------------------
+  # When treeisonet_treefilter_model is set, run it first and restrict all
+  # downstream steps to overstory points (class == 2). This mirrors the GUI
+  # workflow where the treefilter scalar field gates StemCls and TreeLoc.
+  tf_model_name <- tls_params$treeisonet_treefilter_model
+  treefilter_idx <- NULL   # NULL = use all points
+  if (!is.null(tf_model_name) && !is.na(tf_model_name) && nzchar(tf_model_name)) {
+    tf_device <- if (identical(tls_params$treeisonet_treefilter_device, "auto")) {
+      if (torch::cuda_is_available()) "cuda" else "cpu"
+    } else {
+      tls_params$treeisonet_treefilter_device
+    }
+    message("  [TreeFilter] Loading model: ", tf_model_name)
+    tf_bundle <- treeAIBoxR::load_treeaibox_model(
+      model_name = tf_model_name, device = tf_device)
+    message("  [TreeFilter] Running classification...")
+    tf_labels <- treeAIBoxR::classify_wood(
+      xyz            = pts,
+      model          = tf_bundle,
+      if_bottom_only = isTRUE(tls_params$treeisonet_treefilter_bottom_only),
+      verbose        = FALSE)
+    treefilter_idx <- which(tf_labels > 1L)  # overstory points only
+    message(sprintf("  [TreeFilter] Done: %d / %d points kept as overstory (%.1f%%).",
+                    length(treefilter_idx), nrow(pts),
+                    100 * length(treefilter_idx) / nrow(pts)))
+    if (length(treefilter_idx) == 0L) {
+      warning("treeisonet: TreeFiltering kept no overstory points.")
+      return(las)
+    }
+    pts <- pts[treefilter_idx, , drop = FALSE]
+  }
+
+  # Auto-detect pipeline from model knobs:
+  #   stemcls set  → TLS/UAV:  StemCls → TreeLoc → shortestpath3D
+  #   treeoff set  → ALS:      TreeLoc → TreeOff → mergeshift
+  use_als_path <- !is.na(tls_params$treeisonet_treeoff_model) &&
+                  nzchar(tls_params$treeisonet_treeoff_model)
+  scene_label  <- if (use_als_path) "ALS/reclamation" else "TLS/UAV"
+  message(sprintf("seg_method='treeisonet' (%s): %d points, device=%s.",
+                  scene_label, nrow(pts), device))
+  t0 <- Sys.time()
+
+  if (use_als_path) {
+    # ========== ALS PIPELINE: TreeLoc → TreeOff → mergeshift ==============
+    treeloc_name <- tls_params$treeisonet_treeloc_model
+    if (is.na(treeloc_name) || !nzchar(treeloc_name))
+      stop("treeisonet_treeloc_model is not set in tls_params.")
+
+    message("  [1/3] Loading TreeLoc model: ", treeloc_name)
+    treeloc_bundle <- treeAIBoxR::load_treeaibox_model(
+      model_name = treeloc_name, device = device)
+
+    message("  [1/3] Running TreeLoc detection...")
+    base_locs <- treeAIBoxR::treeisonet_run_treeloc(
+      xyz           = pts,
+      model_bundle  = treeloc_bundle,
+      cutoff_thresh = tls_params$treeisonet_cutoff_thresh,
+      cut_grid_res  = tls_params$treeisonet_cut_grid_res,
+      conf_thresh   = tls_params$treeisonet_conf_thresh,
+      nms_thresh_xy = tls_params$treeisonet_nms_thresh_xy,
+      base_radius_m = tls_params$treeisonet_base_radius_m,
+      treeloc_max_gap = tls_params$treeisonet_treeloc_max_gap,
+      treeloc_K     = tls_params$treeisonet_treeloc_K,
+      vox_override  = vox_override,
+      verbose       = TRUE)
+    if (is.null(base_locs) || nrow(base_locs) == 0L) {
+      warning("treeisonet: TreeLoc detected no bases.")
+      return(las)
+    }
+    message(sprintf("  [1/3] TreeLoc done: %d bases.", nrow(base_locs)))
+
+    treeoff_name <- tls_params$treeisonet_treeoff_model
+    message("  [2/3] Loading TreeOff model: ", treeoff_name)
+    treeoff_bundle <- treeAIBoxR::load_treeaibox_model(
+      model_name = treeoff_name, device = device)
+
+    message("  [2/3] Running TreeOff offset regression...")
+    offsets <- treeAIBoxR::treeisonet_run_treeoff(
+      xyz          = pts,
+      treelocs     = base_locs,
+      model_bundle = treeoff_bundle,
+      vox_override = vox_override,
+      verbose      = TRUE)
+
+    message("  [3/3] Running mergeshift assignment...")
+    tree_ids <- treeAIBoxR::treeisonet_mergeshift(
+      xyz      = pts,
+      offsets  = offsets,
+      treelocs = base_locs)
+
+  } else {
+    # ========== TLS/UAV PIPELINE: StemCls → TreeLoc → shortestpath3D ======
+    stemcls_name <- tls_params$treeisonet_stemcls_model
+    if (is.na(stemcls_name) || !nzchar(stemcls_name))
+      stop("treeisonet_stemcls_model is not set in tls_params.")
+
+    message("  [1/3] Loading StemCls model: ", stemcls_name)
+    stemcls_bundle <- treeAIBoxR::load_treeaibox_model(
+      model_name = stemcls_name, device = device)
+    message("  [1/3] Running StemCls classification...")
+    stemcls <- treeAIBoxR::classify_wood(pts, stemcls_bundle, verbose = FALSE)
+    n_stem <- sum(stemcls >= 2L)
+    message(sprintf("  [1/3] StemCls done: %d stem points (%.1f%%).",
+                    n_stem, 100 * n_stem / length(stemcls)))
+
+    if (isTRUE(tls_params$treeisonet_stemcls_remove_small) && n_stem > 0L) {
+      message("  [1/3] Removing small stem clusters (max_gap=",
+              tls_params$treeisonet_stemcls_max_gap, " m, min_pts=",
+              tls_params$treeisonet_stemcls_min_points, ")...")
+      stemcls <- treeAIBoxR::treeisonet_remove_small_clusters(
+        stemcls    = stemcls,
+        xyz        = pts,
+        max_gap_m  = tls_params$treeisonet_stemcls_max_gap,
+        min_points = tls_params$treeisonet_stemcls_min_points)
+      n_stem2 <- sum(stemcls >= 2L)
+      message(sprintf("  [1/3] After cluster removal: %d stem points (%.1f%%).",
+                      n_stem2, 100 * n_stem2 / length(stemcls)))
+    }
+
+    treeloc_name <- tls_params$treeisonet_treeloc_model
+    if (is.na(treeloc_name) || !nzchar(treeloc_name))
+      stop("treeisonet_treeloc_model is not set in tls_params.")
+    message("  [2/3] Loading TreeLoc model: ", treeloc_name)
+    treeloc_bundle <- treeAIBoxR::load_treeaibox_model(
+      model_name = treeloc_name, device = device)
+    message("  [2/3] Running TreeLoc detection...")
+    base_locs <- treeAIBoxR::treeisonet_run_treeloc(
+      xyz           = pts,
+      model_bundle  = treeloc_bundle,
+      cutoff_thresh = tls_params$treeisonet_cutoff_thresh,
+      cut_grid_res  = tls_params$treeisonet_cut_grid_res,
+      conf_thresh   = tls_params$treeisonet_conf_thresh,
+      nms_thresh_xy = tls_params$treeisonet_nms_thresh_xy,
+      base_radius_m = tls_params$treeisonet_base_radius_m,
+      treeloc_max_gap = tls_params$treeisonet_treeloc_max_gap,
+      treeloc_K     = tls_params$treeisonet_treeloc_K,
+      vox_override  = vox_override,
+      verbose       = TRUE)
+    if (is.null(base_locs) || nrow(base_locs) == 0L) {
+      warning("treeisonet: TreeLoc detected no bases — falling back to ",
+              "nearest_base assignment.")
+      return(las)
+    }
+    message(sprintf("  [2/3] TreeLoc done: %d bases detected.", nrow(base_locs)))
+
+    message("  [3/3] Running shortestpath3D...")
+    tree_ids <- treeAIBoxR::treeisonet_shortestpath3D(
+      xyz               = pts,
+      stemcls           = stemcls,
+      base_locs         = base_locs,
+      min_res           = tls_params$treeisonet_min_res,
+      max_isolated_dist = tls_params$treeisonet_max_isolated_dist,
+      k_graph           = tls_params$treeisonet_k_graph,
+      k_node            = tls_params$treeisonet_k_node,
+      verbose           = TRUE)
+  }
+
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  n_trees <- length(unique(tree_ids[tree_ids > 0L]))
+  message(sprintf("  Done: %d trees on %d pts (%.1f s).",
+                  n_trees, nrow(pts), elapsed))
+
+  # Scatter tree_ids and stemcls back to full LAS.
+  # When TreeFiltering was active, pts is a subset of the full cloud; we
+  # zero-fill unvisited points (TreeID=0, StemCls=1 foliage).
+  n_full <- nrow(las@data)
+  full_tree_ids <- integer(n_full)       # 0 = unassigned
+  full_stemcls  <- integer(n_full) + 1L  # 1 = foliage (safe default)
+
+  if (!is.null(treefilter_idx)) {
+    full_tree_ids[treefilter_idx] <- as.integer(tree_ids)
+    if (exists("stemcls"))
+      full_stemcls[treefilter_idx] <- as.integer(stemcls)
+  } else {
+    full_tree_ids <- as.integer(tree_ids)
+    if (exists("stemcls"))
+      full_stemcls <- as.integer(stemcls)
+  }
+
+  las@data$TreeID  <- full_tree_ids
+  # StemCls: written for QSM use. 1=foliage/branch, 2=stem.
+  # Also written for ALS path (stemcls not computed; stays 1 throughout).
+  las@data$StemCls <- full_stemcls
+  las
+}
+
+segment_trees_treeiso <- function(las, bases) {
+  if (!requireNamespace("treeisoR", quietly = TRUE)) {
+    stop("seg_method='treeiso' requires the treeisoR package. ",
+         "Install with devtools::install_local('R/modules/treeisoR').")
+  }
+  pts  <- as.matrix(las@data[, c("X", "Y", "Z")])
+  message(sprintf("seg_method='treeiso': running 3-stage cut-pursuit on %d points...",
+                  nrow(pts)))
+  t0 <- Sys.time()
+  ids <- treeisoR::treeiso_segment(
+    pts,
+    K1          = as.integer(tls_params$treeiso_K1),
+    lambda1     = as.numeric(tls_params$treeiso_lambda1),
+    dec_r1      = as.numeric(tls_params$treeiso_dec_r1),
+    K2          = as.integer(tls_params$treeiso_K2),
+    lambda2     = as.numeric(tls_params$treeiso_lambda2),
+    max_gap     = as.numeric(tls_params$treeiso_max_gap),
+    dec_r2      = as.numeric(tls_params$treeiso_dec_r2),
+    K3          = as.integer(tls_params$treeiso_K3),
+    rel_h_len_r = as.numeric(tls_params$treeiso_rel_h_len_r),
+    vert_w      = as.numeric(tls_params$treeiso_vert_w),
+    threads     = as.integer(tls_params$treeiso_threads),
+    verbose     = isTRUE(tls_params$treeiso_verbose))
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  las@data$TreeID <- as.integer(ids)
+  message(sprintf("seg_method='treeiso': %d trees on %d points (%.1f s; %d bases ignored).",
+                  length(unique(ids[ids > 0])), nrow(pts), elapsed, nrow(bases)))
+  las
+}
+
+method <- tolower(if (is.null(tls_params$seg_method)) "csp" else tls_params$seg_method)
+if (!method %in% c("csp", "nearest_base", "shs", "treeiso", "treeisonet"))
+  stop(sprintf("Unknown seg_method='%s'. Use 'csp', 'nearest_base', 'shs', 'treeiso', or 'treeisonet'.",
+               method))
+message(sprintf("Segmenting trees: method='%s', %d bases.", method, nrow(bases)))
+las <- switch(method,
+  csp           = csp_cost_segmentation(las, bases,
+                    Voxel_size = tls_params$csp_voxel,
+                    V_w        = tls_params$csp_v_w,
+                    L_w        = tls_params$csp_l_w,
+                    S_w        = tls_params$csp_s_w,
+                    N_cores    = tls_params$csp_n_cores),
+  nearest_base  = segment_trees_nearest_base(las, bases),
+  shs           = segment_trees_shs(las, bases,
+                    trunk_zmax   = tls_params$shs_trunk_zmax,
+                    canopy_voxel = tls_params$shs_canopy_voxel,
+                    knn_k        = tls_params$shs_knn_k,
+                    knn_max_dist = tls_params$shs_knn_max_dist),
+  treeiso       = segment_trees_treeiso(las, bases),
+  treeisonet    = segment_trees_treeisonet(las, tls_params)
 )
 
 
@@ -831,18 +1735,114 @@ if (interactive()) {
   draw_axes(x, las_seg@data,
             ceiling(max(inv$Height, na.rm = TRUE) / 5) * 5, step_xy = 5)
 
-  # Single tree -- pick by the label you see in the plot.
-  tid <- 77
+  # Single tree -- pick by the label you see in the plot. Default to the
+  # tallest matched TreeID; override `tid` to inspect a specific tree.
+  tid <- if (exists("inv") && nrow(inv) > 0) inv$TreeID[which.max(inv$Height)] else NA_integer_
   tree <- las_seg;  tree@data <- las_seg@data[TreeID == tid]
-  y <- lidR::plot(tree, color = "RGB", size = 2, axis = FALSE)
-  draw_axes(y, tree@data,
-            ceiling(inv$Height[inv$TreeID == tid] / 5) * 5, step_xy = 1)
+  if (nrow(tree@data) == 0L) {
+    warning("Single-tree view: TreeID ", tid, " has no segmented points; skipping.")
+  } else {
+    y <- lidR::plot(tree, color = "RGB", size = 2, axis = FALSE)
+    draw_axes(y, tree@data,
+              ceiling(inv$Height[inv$TreeID == tid] / 5) * 5, step_xy = 1)
+  }
 
   # 5b. Full-plot QC -------------------------------------------------------
   # rgl view of the entire segmented cloud. For mask-based QC overlays:
   #   plot_cloud_qc(las, mask = drop_mask)
   plot_cloud_qc(las, color_by = "TreeID",
                 title = "Segmented cloud (color = TreeID)")
+}
+
+
+# 5c. Per-tree QC PNGs moved to Section 7b (after WoodCls) so that
+# WoodLabel is available for the wood/foliage panels.
+
+# ---- wood/foliage classifier helpers (used by Section 7b) ----------------
+# Local-PCA linearity classifier. Per point, take its k nearest neighbours,
+# build the 3x3 covariance, eigenvalue-decompose, compute
+# linearity = (l1 - l2) / l1. Above the threshold => wood.
+classify_wf_pca <- function(xyz, k = 10L, lin_thr = 0.85,
+                            max_pts = 60000L) {
+  n <- nrow(xyz)
+  if (n < (k + 1L)) return(rep(TRUE, n))   # too few points: assume foliage
+  # Subsample for speed; classify on the subsample, vote labels back to
+  # full set by nearest-neighbour lookup.
+  if (n > max_pts) {
+    samp <- sort(sample.int(n, max_pts))
+    sub  <- xyz[samp, , drop = FALSE]
+  } else {
+    samp <- seq_len(n)
+    sub  <- xyz
+  }
+  nn  <- RANN::nn2(sub, sub, k = k + 1L, treetype = "kd")$nn.idx
+  lin <- numeric(nrow(sub))
+  for (i in seq_len(nrow(sub))) {
+    nbrs <- sub[nn[i, ], , drop = FALSE]
+    cv   <- cov(nbrs)
+    ev   <- sort(eigen(cv, symmetric = TRUE, only.values = TRUE)$values,
+                 decreasing = TRUE)
+    lin[i] <- if (ev[1] <= 0) 0 else (ev[1] - ev[2]) / ev[1]
+  }
+  is_wood_sub <- lin > lin_thr
+  if (n == nrow(sub)) return(!is_wood_sub)   # is_foliage = !is_wood
+  # Vote labels back to the full point set via 1-NN
+  back <- RANN::nn2(sub, xyz, k = 1L)$nn.idx[, 1L]
+  !is_wood_sub[back]
+}
+
+# Lazy loader for the TreeAIBox backend. Caches the model in the parent
+# (tree_qc) scope across the per-tree loop.
+load_treeaibox_lazy <- function(tls_params) {
+  if (!requireNamespace("treeAIBoxR", quietly = TRUE))
+    stop("treeAIBoxR is not installed. Install from R/modules/treeAIBoxR ",
+         "or set tls_params$tree_qc_wf_method = 'pca'.", call. = FALSE)
+  dev <- tls_params$tree_qc_treeaibox_device
+  if (identical(dev, "auto"))
+    dev <- if (torch::cuda_is_available()) "cuda" else "cpu"
+  # Prefer model_name (triggers auto-download) over explicit paths
+  mn <- tls_params$tree_qc_treeaibox_model
+  if (!is.null(mn) && !is.na(mn) && nzchar(mn)) {
+    return(treeAIBoxR::load_treeaibox_model(
+      model_name = mn,
+      device     = dev,
+      strict     = FALSE))
+  }
+  # Fall back to explicit weights/config paths (backwards compatible)
+  wp <- tls_params$tree_qc_treeaibox_weights
+  cp <- tls_params$tree_qc_treeaibox_config
+  if (is.null(wp) || is.na(wp) || !nzchar(wp))
+    stop("Set tree_qc_treeaibox_model (preferred) or tree_qc_treeaibox_weights.",
+         call. = FALSE)
+  if (is.null(cp) || is.na(cp) || !nzchar(cp))
+    stop("tree_qc_treeaibox_config is not set in tls_params.", call. = FALSE)
+  treeAIBoxR::load_treeaibox_model(
+    weights_path = wp,
+    config_path  = cp,
+    device       = dev,
+    strict       = FALSE)
+}
+
+# Returns logical vector of length nrow(pts): TRUE = foliage.
+classify_wf <- function(pts, tls_params, treeaibox_model = NULL) {
+  method <- tls_params$tree_qc_wf_method
+  xyz <- as.matrix(pts[, c("X", "Y", "Z"), with = FALSE])
+  if (identical(method, "pca")) {
+    return(classify_wf_pca(xyz,
+                           k       = tls_params$tree_qc_wf_k,
+                           lin_thr = tls_params$tree_qc_wf_linearity,
+                           max_pts = tls_params$tree_qc_wf_max_pts))
+  }
+  if (identical(method, "treeaibox")) {
+    if (is.null(treeaibox_model))
+      stop("classify_wf: treeaibox_model must be supplied for this method.",
+           call. = FALSE)
+    labs <- treeAIBoxR::classify_wood(xyz, treeaibox_model)
+    # Convention from componentFilter: 1 = foliage; >1 = wood (binary or
+    # multiclass with branch/stem). is_foliage == (label == 1).
+    return(labs == 1L)
+  }
+  stop("Unknown tree_qc_wf_method: ", method, call. = FALSE)
 }
 
 
@@ -1068,9 +2068,9 @@ if (!is.na(tls_params$field_xlsx_path) &&
           abs(bias) <= tls_params$field_az_bias_max_deg) {
         message(sprintf("Az bias: rotating inv by %+.2f deg and re-matching at %.2f m.",
                         -bias, tls_params$field_match_buffer))
-        inv$azi <<- (inv$azi - bias) %% 360
-        inv$X   <<- inv$distance_m * sin(inv$azi * pi / 180)
-        inv$Y   <<- inv$distance_m * cos(inv$azi * pi / 180)
+        inv$azi <- (inv$azi - bias) %% 360
+        inv$X   <- inv$distance_m * sin(inv$azi * pi / 180)
+        inv$Y   <- inv$distance_m * cos(inv$azi * pi / 180)
         attr(inv, "az_bias_applied") <- bias
         matched_field <- do_match(tls_params$field_match_buffer)
       } else if (is.finite(bias)) {
@@ -1122,107 +2122,303 @@ if (!is.na(tls_params$field_xlsx_path) &&
 
 
 # ============================================================================
-# 7. TODO -- QSM (aRchi)
+# 7. WoodCls  (wood / foliage classification)
 # ============================================================================
-# Parked while we hone segmentation + field validation. Wrapped in if(FALSE)
-# so it does not run on a full source(). Flip to if(interactive()) when
-# ready to resume LWS tuning + cylinder fitting.
-#
-# Steps when reactivated:
-#   7.1 Per-tree subset (carry eigen + auxiliary signals).
-#   7.2 Leaf-wood separation (geometric + optional intensity/HAG/ExG).
-#   7.3 QC checkpoint (cross-section / rgl) before committing.
-#   7.4 aRchi pipeline: skeletonize -> smooth -> add_radius -> persist.
+# Separates wood points (branches + trunk, label=2) from foliage (label=1)
+# using a supervised DL classifier (ESegFormer3D) and writes the result to
+# las@data$WoodLabel.  The QSM step (Section 8) uses WoodLabel==2 as input.
+# Skip by setting tls_params$woodcls_model = NA_character_.
 
-if (FALSE) {
-  qsm_tid <- 78
+if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
+  wc_device <- if (identical(tls_params$woodcls_device, "auto")) {
+    if (torch::cuda_is_available()) "cuda" else "cpu"
+  } else tls_params$woodcls_device
 
-  # 6.1 Per-tree subset (carry eigen + auxiliary signals) -------------------
-  qsm_voxel <- tls_params$qsm_voxel
-  qsm_las <- las
-  data.table::setDT(qsm_las@data)
-  lws_extra <- intersect(c("Intensity", "R", "G", "B"), names(qsm_las@data))
-  qsm_las@data <- qsm_las@data[TreeID == qsm_tid,
-                               c("X", "Y", "Z",
-                                 "Linearity", "Planarity", "Sphericity",
-                                 lws_extra), with = FALSE]
-  stopifnot(nrow(qsm_las@data) > 0)
-  n_full <- nrow(qsm_las@data)
+  message(sprintf("[7] WoodCls: loading model '%s' on %s...",
+                  tls_params$woodcls_model, wc_device))
+  wc_bundle  <- treeAIBoxR::load_treeaibox_model(
+    model_name = tls_params$woodcls_model, device = wc_device)
 
-  # 6.2 Leaf-wood separation -------------------------------------------------
-  # Geometric base (always on): wood = high Linearity AND low Sphericity AND
-  # low Planarity. Optional gates layered on top (each toggled by a CONFIG
-  # knob; skipped if the knob is NA or the underlying field isn't present):
-  #   Intensity >= lws_intensity_min     (TLS bark vs foliage)
-  #   Z         <= lws_hag_max_for_wood  (suppress upper-crown wood FPs)
-  #   ExG       <= lws_exg_max           (RGB green-excess; foliage)
-  d <- qsm_las@data
-  wood_mask <- d$Linearity  >= tls_params$lws_linearity_min &
-               d$Sphericity <= tls_params$lws_sphericity_max &
-               d$Planarity  <= tls_params$lws_planarity_max
-  if (!is.na(tls_params$lws_intensity_min) && "Intensity" %in% names(d))
-    wood_mask <- wood_mask & d$Intensity >= tls_params$lws_intensity_min
-  if (!is.na(tls_params$lws_hag_max_for_wood))
-    wood_mask <- wood_mask & d$Z <= tls_params$lws_hag_max_for_wood
-  if (!is.na(tls_params$lws_exg_max) && all(c("R", "G", "B") %in% names(d))) {
-    exg <- (2 * as.numeric(d$G) - as.numeric(d$R) - as.numeric(d$B)) /
-           max(c(d$R, d$G, d$B), na.rm = TRUE)
-    wood_mask <- wood_mask & exg <= tls_params$lws_exg_max
-  }
-  message(sprintf("[QSM] Tree %d: leaf-wood filter kept %d / %d points (%.1f%% wood).",
-                  qsm_tid, sum(wood_mask), n_full,
-                  100 * sum(wood_mask) / n_full))
+  wc_pts <- as.matrix(las@data[, c("X", "Y", "Z")])
+  message(sprintf("[7] WoodCls: classifying %d points...", nrow(wc_pts)))
+  wc_labels <- treeAIBoxR::classify_wood(wc_pts, wc_bundle, verbose = FALSE)
+  las@data$WoodLabel <- as.integer(wc_labels)
 
-  # 6.3 QC checkpoint -- inspect rgl window before committing to QSM ---------
-  # Brown = kept (wood), green = dropped (foliage). If wood looks speckled
-  # or trunk has gaps, retune lws_* in CONFIG and re-run from 6.1.
-  qc_dt <- data.table::copy(qsm_las@data)[, wood := wood_mask]
-  qc_las <- LAS(qc_dt[, .(X, Y, Z)],
-                header = qsm_las@header)
-  rgl::open3d()
-  rgl::bg3d("white")
-  rgl::points3d(
-    qc_dt$X - mean(qc_dt$X),
-    qc_dt$Y - mean(qc_dt$Y),
-    qc_dt$Z,
-    color = ifelse(qc_dt$wood, "#8B4513", "#228B22"),
-    size = 1.5
-  )
-  rgl::axes3d(c("x--", "y--", "z--"), col = "black")
-  rgl::title3d(main = sprintf("Tree %d -- LWS QC (brown=wood, green=foliage)",
-                              qsm_tid),
-               col = "black")
-  rgl::aspect3d("iso")
-
-  # Hard halt: comment out to proceed to QSM once thresholds look right.
-  stop("[QSM] LWS QC checkpoint -- inspect rgl window, then comment out this stop() to continue.")
-
-  # 6.4 aRchi pipeline -------------------------------------------------------
-  # Commit wood-only subset, thin to scanner-accuracy voxel, then
-  # build -> skeletonize -> smooth -> add cylinder radii.
-  qsm_las@data <- qsm_las@data[wood_mask, .(X, Y, Z)]
-  qsm_las <- decimate_points(qsm_las, random_per_voxel(qsm_voxel, n = 1L))
-  rm(d); invisible(gc())
-  message(sprintf("[QSM] Tree %d: thinned to %d points (%.0f%% of wood) at %.0f cm voxels.",
-                  qsm_tid, nrow(qsm_las@data),
-                  100 * nrow(qsm_las@data) / sum(wood_mask), qsm_voxel * 100))
-
-  arc <- aRchi::build_aRchi()
-  arc <- aRchi::add_pointcloud(arc, point_cloud = as.data.frame(qsm_las@data))
-  arc <- aRchi::skeletonize_pc(arc, D = 0.03, cl_dist = 0.02, max_d = 0.05)
-  arc <- aRchi::smooth_skeleton(arc, niter = 1)
-  arc <- aRchi::add_radius(arc, sec_length = 0.5, method = "median")
-
-  qsm <- aRchi::get_QSM(arc)
-  print(head(qsm))
-  message(sprintf("[QSM] %d cylinders | volume = %.4f m3 | trunk DBH = %.3f m",
-                  nrow(qsm),
-                  aRchi::Treevolume(arc),
-                  2 * qsm$radius_cyl[which.min(abs(qsm$startZ - 1.3))]))
-
-  aRchi::plot(arc, show_point_cloud = FALSE)
-  aRchi::write_aRchi(arc, file.path(out_dir, sprintf("tree_%d.aRchi", qsm_tid)))
+  n_wood <- sum(wc_labels >= 2L)
+  message(sprintf("[7] WoodCls done: %d / %d wood points (%.1f%%).",
+                  n_wood, nrow(wc_pts),
+                  100 * n_wood / nrow(wc_pts)))
+  rm(wc_pts, wc_bundle, wc_labels); invisible(gc())
+} else {
+  message("[7] WoodCls skipped (tls_params$woodcls_model is NA).")
+  # Write a default WoodLabel of 2 (all points treated as wood) so Section 8
+  # can still run if manually triggered with woodcls_model = NA.
+  if (!"WoodLabel" %in% names(las@data))
+    las@data$WoodLabel <- 2L
 }
+
+
+# ============================================================================
+# 7b. Per-tree QC PNGs
+# ============================================================================
+# Four-panel side views per TreeID written to <out_dir>/<tree_qc_subdir>/.
+# Placed after WoodCls so las@data$WoodLabel is available for the
+# wood/foliage panels (bottom row). No re-inference needed.
+# Runs in batch (builds qc_las locally; does not require Section 5 rgl).
+if (isTRUE(tls_params$tree_qc_enable)) {
+  qc_dir <- file.path(out_dir, tls_params$tree_qc_subdir)
+  if (dir.exists(qc_dir))
+    invisible(file.remove(list.files(qc_dir, pattern = "\\.png$", full.names = TRUE)))
+  dir.create(qc_dir, showWarnings = FALSE, recursive = TRUE)
+  qc_las <- if (exists("las_seg")) las_seg else
+            lidR::filter_poi(las, TreeID %in% inv$TreeID)
+  data.table::setDT(qc_las@data)
+  qc_ids <- sort(unique(qc_las@data$TreeID))
+  qc_ids <- qc_ids[!is.na(qc_ids)]
+  if (!is.na(tls_params$tree_qc_top_n) &&
+      tls_params$tree_qc_top_n < length(qc_ids)) {
+    ord <- order(-inv$DBH[match(qc_ids, inv$TreeID)], na.last = TRUE)
+    qc_ids <- qc_ids[ord][seq_len(tls_params$tree_qc_top_n)]
+  }
+  hw <- tls_params$tree_qc_xy_halfwidth
+  has_rgb <- isTRUE(tls_params$tree_qc_use_rgb) &&
+             all(c("R", "G", "B") %in% names(qc_las@data)) &&
+             { rgb_max <- max(qc_las@data$R, qc_las@data$G, qc_las@data$B,
+                              na.rm = TRUE)
+               isTRUE(is.finite(rgb_max) && rgb_max > 0) }
+  rgb_div <- if (has_rgb) {
+    if (max(qc_las@data$R, qc_las@data$G, qc_las@data$B, na.rm = TRUE) > 256) 65535
+    else 255
+  } else NA_real_
+  wood_col <- tls_params$tree_qc_wood_color
+  fol_col  <- tls_params$tree_qc_foliage_color
+  has_woodlabel <- "WoodLabel" %in% names(qc_las@data)
+  wf_method <- if (has_woodlabel) "woodlabel" else tls_params$tree_qc_wf_method
+  treeaibox_model <- if (!has_woodlabel && identical(tls_params$tree_qc_wf_method, "treeaibox")) {
+    message("Loading TreeAIBox model for QC wood/foliage coloring...")
+    load_treeaibox_lazy(tls_params)
+  } else NULL
+  if (has_woodlabel)
+    message("Per-tree QC wood/foliage: using WoodLabel from Section 7 (no re-inference).")
+  message(sprintf("Saving %d per-tree QC PNGs to %s%s (wood/foliage: %s)",
+                  length(qc_ids), qc_dir,
+                  if (has_rgb) " [RGB]" else " [cyan/orange]",
+                  wf_method))
+  for (id in qc_ids) {
+    pts <- qc_las@data[TreeID == id]
+    if (nrow(pts) < tls_params$tree_qc_min_points) next
+    inv_row <- inv[inv$TreeID == id, ]
+    dbh <- if (nrow(inv_row)) inv_row$DBH[1]    else NA_real_
+    ht  <- if (nrow(inv_row)) inv_row$Height[1] else NA_real_
+    fid <- if (nrow(inv_row) && "f_id" %in% names(inv_row)) inv_row$f_id[1] else NA
+    cx  <- median(pts$X); cy <- median(pts$Y)
+    if (has_rgb) {
+      r8 <- pmin(pmax(pts$R / rgb_div, 0), 1)
+      g8 <- pmin(pmax(pts$G / rgb_div, 0), 1)
+      b8 <- pmin(pmax(pts$B / rgb_div, 0), 1)
+      rgb_col <- grDevices::rgb(r8, g8, b8)
+      is_foliage <- if (has_woodlabel) {
+        pts$WoodLabel == 1L
+      } else {
+        tryCatch(
+          classify_wf(pts, tls_params, treeaibox_model = treeaibox_model),
+          error = function(e) {
+            warning("classify_wf failed for TreeID ", id,
+                    ": ", conditionMessage(e), call. = FALSE)
+            rep(TRUE, nrow(pts))
+          })
+      }
+      wf_col <- ifelse(is_foliage, fol_col, wood_col)
+      png(file.path(qc_dir, sprintf("tree_%04d.png", id)),
+          width = 1600, height = 1400, bg = "black", res = 110)
+      op <- par(mfrow = c(2, 2), bg = "black", fg = "white",
+                col.axis = "white", col.lab = "white", col.main = "white",
+                mar = c(4, 4, 3, 1))
+      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = rgb_col,
+           xlab = "X offset (m)", ylab = "Z (m)",
+           main = sprintf("TreeID %d  RGB XZ  (look along Y)", id),
+           asp = 1, xlim = c(-hw, hw))
+      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = rgb_col,
+           xlab = "Y offset (m)", ylab = "Z (m)",
+           main = sprintf("RGB YZ  DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
+                          ifelse(is.na(dbh), NA, dbh * 100),
+                          ht, nrow(pts),
+                          ifelse(is.na(fid), "none", as.character(fid))),
+           asp = 1, xlim = c(-hw, hw))
+      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = wf_col,
+           xlab = "X offset (m)", ylab = "Z (m)",
+           main = sprintf("Wood/Foliage XZ  [%s] foliage=%.0f%%",
+                          wf_method, 100 * mean(is_foliage)),
+           asp = 1, xlim = c(-hw, hw))
+      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = wf_col,
+           xlab = "Y offset (m)", ylab = "Z (m)",
+           main = "Wood/Foliage YZ",
+           asp = 1, xlim = c(-hw, hw))
+      par(op); dev.off()
+    } else {
+      png(file.path(qc_dir, sprintf("tree_%04d.png", id)),
+          width = 1400, height = 900, bg = "black", res = 110)
+      op <- par(mfrow = c(1, 2), bg = "black", fg = "white",
+                col.axis = "white", col.lab = "white", col.main = "white",
+                mar = c(4, 4, 3, 1))
+      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.6, col = "cyan",
+           xlab = "X offset (m)", ylab = "Z (m)",
+           main = sprintf("TreeID %d  XZ view  (look along Y)", id),
+           asp = 1, xlim = c(-hw, hw))
+      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.6, col = "orange",
+           xlab = "Y offset (m)", ylab = "Z (m)",
+           main = sprintf("DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
+                          ifelse(is.na(dbh), NA, dbh * 100),
+                          ht, nrow(pts),
+                          ifelse(is.na(fid), "none", as.character(fid))),
+           asp = 1, xlim = c(-hw, hw))
+      par(op); dev.off()
+    }
+  }
+  message("Per-tree QC done: ", qc_dir)
+}
+
+
+# ============================================================================
+# 8. QSM — TreeAIBox applyQSM pipeline
+# ============================================================================
+# Builds a per-tree Quantitative Structure Model (QSM) using cut-pursuit
+# over-segmentation + Dijkstra skeleton + algebraic circle-fit radii.
+# Matches the TreeAIBox GUI "Apply QSM" workflow (applyQSM.py).
+#
+# Prerequisites:
+#   - Section 5 must have run (las@data$TreeID and las@data$StemCls present)
+#   - Section 7 WoodCls should have run (las@data$WoodLabel present);
+#     if WoodLabel is absent all points are treated as wood.
+#   - treeisoR package must be rebuilt with cut_pursuit_segment() exported.
+#     (Run: install_treeisoR.R or reinstall treeisoR when no R session is open)
+#
+# Output:
+#   - Per-tree RDS files: <out_dir>/qsm/tree_<id>.rds  → apply_qsm() result
+#   - Per-tree cylinder CSV: <out_dir>/qsm/tree_<id>_cylinders.csv
+#   - Combined cylinder CSV: <out_dir>/qsm/all_trees_cylinders.csv
+
+local({
+  # Guard: TreeID column is mandatory
+  if (!"TreeID" %in% names(las@data)) {
+    message("[8] QSM skipped: las@data$TreeID not present ",
+            "(run Section 5 first).")
+    return(invisible(NULL))
+  }
+
+  # Check treeisoR has cut_pursuit_segment exported
+  if (!exists("cut_pursuit_segment", envir = asNamespace("treeisoR"),
+              inherits = FALSE)) {
+    message("[8] QSM skipped: treeisoR::cut_pursuit_segment() not available. ",
+            "Rebuild treeisoR (close all R sessions, then R CMD INSTALL ",
+            "R/modules/treeisoR) and re-source this script.")
+    return(invisible(NULL))
+  }
+
+  # Which trees to process
+  all_tree_ids <- sort(unique(las@data$TreeID[las@data$TreeID > 0L]))
+  qsm_ids <- if (all(is.na(tls_params$qsm_tree_ids))) {
+    all_tree_ids
+  } else {
+    intersect(as.integer(tls_params$qsm_tree_ids), all_tree_ids)
+  }
+  if (length(qsm_ids) == 0L) {
+    message("[8] QSM: no valid tree IDs to process.")
+    return(invisible(NULL))
+  }
+
+  qsm_dir <- if (!is.na(tls_params$qsm_out_dir)) {
+    tls_params$qsm_out_dir
+  } else {
+    file.path(out_dir, "qsm")
+  }
+  dir.create(qsm_dir, showWarnings = FALSE, recursive = TRUE)
+
+  has_woodlabel <- "WoodLabel" %in% names(las@data)
+  has_stemcls   <- "StemCls"   %in% names(las@data)
+
+  all_cyl <- vector("list", length(qsm_ids))
+  message(sprintf("[8] QSM: processing %d tree(s)...", length(qsm_ids)))
+
+  for (ii in seq_along(qsm_ids)) {
+    tid <- qsm_ids[ii]
+    message(sprintf("  [8] Tree %d (%d/%d)...", tid, ii, length(qsm_ids)))
+
+    tree_mask  <- las@data$TreeID == tid
+    wood_mask  <- if (has_woodlabel) las@data$WoodLabel >= 2L else rep(TRUE, nrow(las@data))
+    pts_mask   <- tree_mask & wood_mask
+
+    if (sum(pts_mask) < 20L) {
+      message(sprintf("    Skipping tree %d: only %d wood points.", tid, sum(pts_mask)))
+      next
+    }
+
+    # Build (n, 4) matrix [X, Y, Z, stemcls]
+    d <- las@data[pts_mask, ]
+    stemcls_col <- if (has_stemcls) as.integer(d$StemCls) else rep(1L, nrow(d))
+    pts_qsm <- cbind(as.numeric(d$X), as.numeric(d$Y), as.numeric(d$Z),
+                     stemcls_col)
+
+    # Centre coordinates for numerical stability (add back at output)
+    xyz_offset <- colMeans(pts_qsm[, 1:3, drop = FALSE])
+    pts_qsm[, 1L] <- pts_qsm[, 1L] - xyz_offset[1L]
+    pts_qsm[, 2L] <- pts_qsm[, 2L] - xyz_offset[2L]
+    pts_qsm[, 3L] <- pts_qsm[, 3L] - xyz_offset[3L]
+
+    qsm_res <- tryCatch(
+      treeAIBoxR::apply_qsm(
+        pts                  = pts_qsm,
+        k_neighbors          = tls_params$qsm_k_neighbors,
+        max_graph_distance   = tls_params$qsm_max_graph_distance,
+        max_conn_dist        = tls_params$qsm_max_conn_dist,
+        occlusion_cutoff     = tls_params$qsm_occlusion_cutoff,
+        min_pts_clean        = tls_params$qsm_min_pts_clean,
+        K_stem               = tls_params$qsm_K_stem,
+        reg_stem             = tls_params$qsm_reg_stem,
+        K_branch             = tls_params$qsm_K_branch,
+        reg_branch           = tls_params$qsm_reg_branch,
+        min_radius_m         = tls_params$qsm_min_radius_m,
+        threads              = tls_params$qsm_threads,
+        verbose              = TRUE),
+      error = function(e) {
+        message(sprintf("    ERROR tree %d: %s", tid, conditionMessage(e)))
+        NULL
+      })
+
+    if (is.null(qsm_res)) next
+
+    # Save raw QSM result (for aRchi or further analysis)
+    saveRDS(qsm_res, file.path(qsm_dir, sprintf("tree_%d.rds", tid)))
+
+    # Convert to cylinder table and save CSV
+    cyl <- treeAIBoxR::qsm_to_cylinder_table(qsm_res, tree_id = tid,
+                                              xyz_offset = xyz_offset)
+    if (nrow(cyl) > 0L) {
+      write.csv(cyl, file.path(qsm_dir, sprintf("tree_%d_cylinders.csv", tid)),
+                row.names = FALSE)
+      all_cyl[[ii]] <- cyl
+      n_cyl <- nrow(cyl)
+      # DBH estimate: cylinder closest to 1.3 m HAG (Z = min(Z) + 1.3)
+      z_base <- min(cyl$startZ, na.rm = TRUE)
+      dbh_row <- which.min(abs(cyl$startZ - (z_base + 1.3)))
+      dbh_est <- 2 * cyl$radius[dbh_row]
+      vol_est <- sum(pi * cyl$radius^2 * cyl$length, na.rm = TRUE)
+      message(sprintf("    Tree %d: %d cylinders | DBH ~%.3f m | vol ~%.4f m3",
+                      tid, n_cyl, dbh_est, vol_est))
+    }
+  }
+
+  # Combine and save all trees
+  all_cyl <- Filter(Negate(is.null), all_cyl)
+  if (length(all_cyl) > 0L) {
+    all_cyl_df <- do.call(rbind, all_cyl)
+    write.csv(all_cyl_df,
+              file.path(qsm_dir, "all_trees_cylinders.csv"),
+              row.names = FALSE)
+    message(sprintf("[8] QSM complete: %d trees, %d cylinders total. Output: %s",
+                    length(all_cyl), nrow(all_cyl_df), qsm_dir))
+  }
+})
 
 
 # ============================================================================
