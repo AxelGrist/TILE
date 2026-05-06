@@ -503,10 +503,6 @@ tls_params <- list(
   downed_z_max         = 1.5,    # m above ground; only points below this are tested
   downed_tilt_min_deg  = 60.0,   # PCA primary-axis tilt from vertical (degrees)
                                   # Xi 2023: >60 deg threshold
-  downed_knn_radius    = 0.5,    # m; 3D radius for PCA neighbourhood (wood-only)
-                                  # Not in paper; tune to typical log diameter
-  downed_knn_min_pts   = 8L,     # minimum wood neighbours for stable PCA
-                                  # Not in paper; increase for sparser scans
 
   # --- Section 9: QSM (TreeAIBox) -----------------------------------------
   # Builds a Quantitative Structure Model per tree using the applyQSM
@@ -1757,8 +1753,8 @@ if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
   if (isTRUE(tls_params$downed_log_enable)) {
     dl_z_max  <- as.numeric(tls_params$downed_z_max)
     dl_tilt   <- as.numeric(tls_params$downed_tilt_min_deg)
-    dl_radius <- as.numeric(tls_params$downed_knn_radius)
-    dl_min_n  <- as.integer(tls_params$downed_knn_min_pts)
+    dl_radius <- 0.5   # m; 3D radius for PCA wood neighbourhood
+    dl_min_n  <- 8L   # minimum wood pts for stable SVD
 
     # All non-ground points below the height ceiling
     dl_cand <- which(las@data$Classification != 2L &
