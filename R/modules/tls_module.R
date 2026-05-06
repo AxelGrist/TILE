@@ -11,7 +11,7 @@
 #      3.3 Stem base detection (shape-aware DBSCAN, plot-extent + continuity).
 #      3.4 Segmentation dispatcher (treeisonet / csp / shs / nearest_base).
 #   4. WoodCls: wood/foliage DL classification -> WoodLabel per point.
-#   5. Per-tree QC PNGs: four-panel RGB + wood/foliage side views per TreeID.
+#   5. Per-tree QC PNGs: four-panel RGB + forest-component side views per TreeID.
 #   6. Forest inventory: DBH, height, position, crown projection per tree.
 #   7. Interactive plotting: 3D whole-plot + single-tree views (requires inv).
 #   8. Field-data validation: buffered candidate search + multi-criteria match.
@@ -1833,8 +1833,9 @@ if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
 # 5. Per-tree QC PNGs
 # ============================================================================
 # Four-panel side views per TreeID written to <out_dir>/<tree_qc_subdir>/.
-# Placed after WoodCls so las@data$WoodLabel is available for the
-# wood/foliage panels (bottom row). No re-inference needed.
+# Top row: RGB XZ / RGB YZ (or component colours if no RGB).
+# Bottom row: forest_component_labels() colouring (8-class palette).
+# Not all classes will appear per tree -- legend is dynamic.
 # Runs in batch (builds qc_las locally; does not require Section 7 rgl).
 if (isTRUE(tls_params$tree_qc_enable)) {
   qc_dir <- file.path(out_dir, tls_params$tree_qc_subdir)
@@ -1867,20 +1868,15 @@ if (isTRUE(tls_params$tree_qc_enable)) {
     if (max(qc_las@data$R, qc_las@data$G, qc_las@data$B, na.rm = TRUE) > 256) 65535
     else 255
   } else NA_real_
-  wood_col <- tls_params$tree_qc_wood_color
-  fol_col  <- tls_params$tree_qc_foliage_color
-  has_woodlabel <- "WoodLabel" %in% names(qc_las@data)
-  wf_method <- if (has_woodlabel) "woodlabel" else tls_params$tree_qc_wf_method
-  treeaibox_model <- if (!has_woodlabel && identical(tls_params$tree_qc_wf_method, "treeaibox")) {
-    message("Loading TreeAIBox model for QC wood/foliage coloring...")
-    load_treeaibox_lazy(tls_params)
-  } else NULL
-  if (has_woodlabel)
-    message("Per-tree QC wood/foliage: using WoodLabel from Section 4 (no re-inference).")
-  message(sprintf("Saving %d per-tree QC PNGs to %s%s (wood/foliage: %s)",
+  fc_pal   <- c("0" = "#aaff01", "1" = "#f02b00", "2" = "#7a4101",
+               "3" = "#0a9e00", "4" = "#9f0aef", "5" = "#f54b8c",
+               "6" = "#ae5504", "7" = "#0000fe")
+  fc_names <- c("0" = "Grass/remaining", "1" = "Stem",    "2" = "Branch",
+               "3" = "Foliage",        "4" = "Downed log", "5" = "Sapling stem",
+               "6" = "Below-canopy br.", "7" = "Ground")
+  message(sprintf("Saving %d per-tree QC PNGs to %s%s",
                   length(qc_ids), qc_dir,
-                  if (has_rgb) " [RGB]" else " [cyan/orange]",
-                  wf_method))
+                  if (has_rgb) " [RGB + component]" else " [component]"))
   for (id in qc_ids) {
     pts <- qc_las@data[TreeID == id]
     if (nrow(pts) < tls_params$tree_qc_min_points) next
@@ -1894,18 +1890,10 @@ if (isTRUE(tls_params$tree_qc_enable)) {
       g8 <- pmin(pmax(pts$G / rgb_div, 0), 1)
       b8 <- pmin(pmax(pts$B / rgb_div, 0), 1)
       rgb_col <- grDevices::rgb(r8, g8, b8)
-      is_foliage <- if (has_woodlabel) {
-        pts$WoodLabel == 1L
-      } else {
-        tryCatch(
-          classify_wf(pts, tls_params, treeaibox_model = treeaibox_model),
-          error = function(e) {
-            warning("classify_wf failed for TreeID ", id,
-                    ": ", conditionMessage(e), call. = FALSE)
-            rep(TRUE, nrow(pts))
-          })
-      }
-      wf_col <- ifelse(is_foliage, fol_col, wood_col)
+      fc_lbl <- forest_component_labels(pts)
+      fc_col <- fc_pal[as.character(fc_lbl)]
+      fc_col[is.na(fc_col)] <- "#aaff01"
+      present <- as.character(sort(unique(fc_lbl)))
       png(file.path(qc_dir, sprintf("tree_%04d.png", id)),
           width = 1600, height = 1400, bg = "black", res = 110)
       op <- par(mfrow = c(2, 2), bg = "black", fg = "white",
@@ -1922,32 +1910,40 @@ if (isTRUE(tls_params$tree_qc_enable)) {
                           ht, nrow(pts),
                           ifelse(is.na(fid), "none", as.character(fid))),
            asp = 1, xlim = c(-hw, hw))
-      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = wf_col,
+      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = fc_col,
            xlab = "X offset (m)", ylab = "Z (m)",
-           main = sprintf("Wood/Foliage XZ  [%s] foliage=%.0f%%",
-                          wf_method, 100 * mean(is_foliage)),
+           main = "Forest components XZ",
            asp = 1, xlim = c(-hw, hw))
-      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = wf_col,
+      legend("topright", legend = fc_names[present], col = fc_pal[present],
+             pch = 16, cex = 0.55, bg = "black", text.col = "white",
+             bty = "o", box.col = "grey40")
+      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = fc_col,
            xlab = "Y offset (m)", ylab = "Z (m)",
-           main = "Wood/Foliage YZ",
+           main = "Forest components YZ",
            asp = 1, xlim = c(-hw, hw))
       par(op); dev.off()
     } else {
+      fc_lbl <- forest_component_labels(pts)
+      fc_col <- fc_pal[as.character(fc_lbl)]
+      fc_col[is.na(fc_col)] <- "#aaff01"
+      present <- as.character(sort(unique(fc_lbl)))
       png(file.path(qc_dir, sprintf("tree_%04d.png", id)),
           width = 1400, height = 900, bg = "black", res = 110)
       op <- par(mfrow = c(1, 2), bg = "black", fg = "white",
                 col.axis = "white", col.lab = "white", col.main = "white",
                 mar = c(4, 4, 3, 1))
-      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.6, col = "cyan",
+      plot(pts$X - cx, pts$Z, pch = ".", cex = 0.6, col = fc_col,
            xlab = "X offset (m)", ylab = "Z (m)",
-           main = sprintf("TreeID %d  XZ view  (look along Y)", id),
-           asp = 1, xlim = c(-hw, hw))
-      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.6, col = "orange",
-           xlab = "Y offset (m)", ylab = "Z (m)",
-           main = sprintf("DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
-                          ifelse(is.na(dbh), NA, dbh * 100),
-                          ht, nrow(pts),
+           main = sprintf("TreeID %d  XZ  DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
+                          id, ifelse(is.na(dbh), NA, dbh * 100), ht, nrow(pts),
                           ifelse(is.na(fid), "none", as.character(fid))),
+           asp = 1, xlim = c(-hw, hw))
+      legend("topright", legend = fc_names[present], col = fc_pal[present],
+             pch = 16, cex = 0.55, bg = "black", text.col = "white",
+             bty = "o", box.col = "grey40")
+      plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.6, col = fc_col,
+           xlab = "Y offset (m)", ylab = "Z (m)",
+           main = "YZ view",
            asp = 1, xlim = c(-hw, hw))
       par(op); dev.off()
     }
