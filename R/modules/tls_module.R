@@ -786,7 +786,9 @@ las <- classify_ground(las, csf(
 ))
 
 las <- normalize_height(las, tin())
-las <- filter_poi(las, Z >= tls_params$z_min, Z <= tls_params$z_max)
+# Keep ground-classified points regardless of z_min: after normalize_height
+# they sit at Z ~ 0, which is below the z_min noise floor (0.2 m default).
+las <- filter_poi(las, Classification == 2L | (Z >= tls_params$z_min & Z <= tls_params$z_max))
 
 # 2.2 Statistical outlier removal --------------------------------------------
 # Drop scanner ghost / mixed-pixel noise. add_geometry() and density-raster
@@ -1877,9 +1879,10 @@ if (isTRUE(tls_params$tree_qc_enable)) {
     invisible(file.remove(list.files(qc_dir, pattern = "\\.png$", full.names = TRUE)))
   dir.create(qc_dir, showWarnings = FALSE, recursive = TRUE)
   has_inv <- exists("inv") && is.data.frame(inv)
-  qc_las <- if (exists("las_seg")) las_seg else if (has_inv)
-    lidR::filter_poi(las, TreeID %in% inv$TreeID) else
-    lidR::filter_poi(las, !is.na(TreeID) & TreeID > 0L)
+  # Always rebuild from the current las so WoodLabel / StemCls / DownedLog
+  # are up-to-date.  A stale las_seg from a previous interactive Section 7
+  # run would be missing those columns.
+  qc_las <- lidR::filter_poi(las, !is.na(TreeID) & TreeID > 0L)
   data.table::setDT(qc_las@data)
   qc_ids <- sort(unique(qc_las@data$TreeID))
   qc_ids <- qc_ids[!is.na(qc_ids)]
@@ -1918,7 +1921,8 @@ if (isTRUE(tls_params$tree_qc_enable)) {
     dbh <- if (nrow(inv_row) && "DBH"    %in% names(inv_row)) inv_row$DBH[1]    else NA_real_
     ht  <- if (nrow(inv_row) && "Height" %in% names(inv_row)) inv_row$Height[1] else NA_real_
     fid <- if (nrow(inv_row) && "f_id" %in% names(inv_row)) inv_row$f_id[1] else NA
-    cx  <- median(pts$X); cy <- median(pts$Y)
+    cx     <- median(pts$X); cy <- median(pts$Y)
+    ylim_z <- range(pts$Z, na.rm = TRUE)   # full tree height, not clipped by asp
     if (has_rgb) {
       r8 <- pmin(pmax(pts$R / rgb_div, 0), 1)
       g8 <- pmin(pmax(pts$G / rgb_div, 0), 1)
@@ -1936,25 +1940,25 @@ if (isTRUE(tls_params$tree_qc_enable)) {
       plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = rgb_col,
            xlab = "X offset (m)", ylab = "Z (m)",
            main = sprintf("TreeID %d  RGB XZ  (look along Y)", id),
-           asp = 1, xlim = c(-hw, hw))
+           xlim = c(-hw, hw), ylim = ylim_z)
       plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = rgb_col,
            xlab = "Y offset (m)", ylab = "Z (m)",
            main = sprintf("RGB YZ  DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
                           ifelse(is.na(dbh), NA, dbh * 100),
                           ht, nrow(pts),
                           ifelse(is.na(fid), "none", as.character(fid))),
-           asp = 1, xlim = c(-hw, hw))
+           xlim = c(-hw, hw), ylim = ylim_z)
       plot(pts$X - cx, pts$Z, pch = ".", cex = 0.7, col = fc_col,
            xlab = "X offset (m)", ylab = "Z (m)",
            main = "Forest components XZ",
-           asp = 1, xlim = c(-hw, hw))
+           xlim = c(-hw, hw), ylim = ylim_z)
       legend("topright", legend = fc_names[present], col = fc_pal[present],
              pch = 16, cex = 0.55, bg = "black", text.col = "white",
              bty = "o", box.col = "grey40")
       plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.7, col = fc_col,
            xlab = "Y offset (m)", ylab = "Z (m)",
            main = "Forest components YZ",
-           asp = 1, xlim = c(-hw, hw))
+           xlim = c(-hw, hw), ylim = ylim_z)
       par(op); dev.off()
     } else {
       fc_lbl <- forest_component_labels(pts)
@@ -1971,14 +1975,14 @@ if (isTRUE(tls_params$tree_qc_enable)) {
            main = sprintf("TreeID %d  XZ  DBH=%.1fcm HT=%.1fm pts=%d  field=%s",
                           id, ifelse(is.na(dbh), NA, dbh * 100), ht, nrow(pts),
                           ifelse(is.na(fid), "none", as.character(fid))),
-           asp = 1, xlim = c(-hw, hw))
+           xlim = c(-hw, hw), ylim = ylim_z)
       legend("topright", legend = fc_names[present], col = fc_pal[present],
              pch = 16, cex = 0.55, bg = "black", text.col = "white",
              bty = "o", box.col = "grey40")
       plot(pts$Y - cy, pts$Z, pch = ".", cex = 0.6, col = fc_col,
            xlab = "Y offset (m)", ylab = "Z (m)",
            main = "YZ view",
-           asp = 1, xlim = c(-hw, hw))
+           xlim = c(-hw, hw), ylim = ylim_z)
       par(op); dev.off()
     }
   }
