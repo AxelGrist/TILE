@@ -501,7 +501,9 @@ tls_params <- list(
   downed_z_max        = 1.5,    # m above ground; candidates above this are skipped
   downed_knn_radius   = 0.3,    # m; 3D radius for PCA neighbourhood
   downed_knn_min_pts  = 5L,     # minimum neighbours for reliable PCA
-  downed_tilt_min_deg = 45.0,   # primary eigenvector tilt from vertical (degrees)
+  downed_tilt_min_deg = 60.0,   # primary eigenvector tilt from vertical (degrees)
+                                 # Xi 2023: >60° clearly demarcates leaning tree
+                                 # layer from downed woody debris layer
 
   # --- Section 9: QSM (TreeAIBox) -----------------------------------------
   # Builds a Quantitative Structure Model per tree using the applyQSM
@@ -657,9 +659,15 @@ plot_cloud_qc <- function(pts,
 # forest_component_labels(): derive 8-class forest fuel component label per point.
 # Uses: Classification (ground), TreeFilterLabel (overstory mask),
 #       StemCls (stem detection), WoodLabel (wood/foliage), DownedLog (PCA tilt).
-# Class 4 (downed logs): wood points near ground (Z <= downed_z_max) with
-# horizontal primary PCA axis (tilt > downed_tilt_min_deg); written to
-# las@data$DownedLog by Section 4, read here via the has_dl guard.
+#
+# Xi 2023 class definitions applied here:
+#   Trees (overstory): stems/branches/foliage with height >= 5 m
+#   Sapling stem (5): StemCls==2 in understory (TreeFilter class 1, height < 5 m)
+#   Below-canopy branch (6): non-stem wood, diameter > 5 cm, understory layer
+#   Downed log (4): wood near ground (Z <= downed_z_max) with primary PCA axis
+#     tilted > downed_tilt_min_deg (default 60 deg) from vertical; the 60 deg
+#     threshold clearly demarcates the leaning-tree layer from downed woody debris
+#     (Xi 2023). Written to las@data$DownedLog by Section 4.
 forest_component_labels <- function(ds) {
   if (inherits(ds, "LAS")) ds <- ds@data
   n   <- nrow(ds)
@@ -690,15 +698,16 @@ forest_component_labels <- function(ds) {
   # Stem: overstory + StemCls == 2 (highest overstory priority)
   if (has_sc) lbl[ov & ds$StemCls == 2L] <- 1L
 
-  # ---- Understory ----
+  # ---- Understory (TreeFilterLabel == 1; height < 5 m per Xi 2023) ----
   # Below-canopy foliage stays 0 (grass/remaining)
   # Below-canopy branch: understory + WoodLabel >= 2 + not sapling stem
+  # (Xi 2023: non-stem wood with diameter > 5 cm in sapling/shrub/surface layers)
   if (has_wc && has_sc)
     lbl[us & ds$WoodLabel >= 2L & ds$StemCls != 2L] <- 6L
   else if (has_wc)
     lbl[us & ds$WoodLabel >= 2L] <- 6L
 
-  # Sapling stem: understory + StemCls == 2 (highest understory priority)
+  # Sapling stem: understory + StemCls == 2; height < 5 m (highest understory priority)
   if (has_sc) lbl[us & ds$StemCls == 2L] <- 5L
 
   # ---- Downed log (class 4) -----------------------------------------------
