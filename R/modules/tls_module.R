@@ -1753,8 +1753,11 @@ if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
   if (isTRUE(tls_params$downed_log_enable)) {
     dl_z_max  <- as.numeric(tls_params$downed_z_max)
     dl_tilt   <- as.numeric(tls_params$downed_tilt_min_deg)
-    dl_radius <- 0.5   # m; 3D radius for PCA wood neighbourhood
-    dl_min_n  <- 8L   # minimum wood pts for stable SVD
+    # PCA neighbourhood radius: 20x the WoodCls voxel resolution gives ~0.5 m
+    # at the default 2.5 cm model, scaling automatically with coarser models.
+    dl_res    <- wc_bundle$cfg$voxel_resolution_in_meter[[1L]]
+    dl_radius <- 20.0 * dl_res
+    dl_min_n  <- 8L    # minimum wood pts for stable SVD
 
     # All non-ground points below the height ceiling
     dl_cand <- which(las@data$Classification != 2L &
