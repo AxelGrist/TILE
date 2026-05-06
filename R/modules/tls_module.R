@@ -613,16 +613,15 @@ plot_cloud_qc <- function(pts,
     ifelse(is.na(ds$WoodLabel), "grey80",
            ifelse(ds$WoodLabel >= 2L, "saddlebrown", "forestgreen"))
   } else if (color_by == "XiLabel") {
-    # Xi 2023 8-class palette (classes 4-6 merged into 0 until extra models added)
-    xi_pal <- c("0" = "#ADFF2F",   # Grass/remaining  (yellow-green)
-                "1" = "#E63000",   # Stem             (red)
-                "2" = "#8B3A00",   # Branch           (reddish-brown)
-                "3" = "#1A6B1A",   # Foliage          (forest green)
-                "4" = "#8B00CC",   # Downed woody log (purple)
-                "5" = "#FF69B4",   # Sapling stem     (pink)
-                "6" = "#6A5ACD",   # Below-canopy br. (slate blue)
-                "7" = "#1E5FCC")   # Ground           (blue)
-    lbl <- compute_xi_label(ds)
+    xi_pal <- c("0" = "#aaff01",   # Grass/remaining  (yellow-green)
+                "1" = "#f02b00",   # Stem             (red)
+                "2" = "#7a4101",   # Branch           (brown)
+                "3" = "#0a9e00",   # Foliage          (green)
+                "4" = "#9f0aef",   # Downed woody log (purple)
+                "5" = "#f54b8c",   # Sapling stem     (pink)
+                "6" = "#ae5504",   # Below-canopy br. (orange-brown)
+                "7" = "#0000fe")   # Ground           (blue)
+    lbl <- forest_component_labels(ds)
     xi_pal[as.character(lbl)]
   } else if (color_by == "Classification" && "Classification" %in% names(ds)) {
     ifelse(ds$Classification == 2L, "saddlebrown", "forestgreen")
@@ -648,20 +647,20 @@ plot_cloud_qc <- function(pts,
                              "3 Foliage", "4 Downed log",
                              "5 Sapling stem", "6 Below-canopy branch",
                              "7 Ground"),
-                  col    = c("#ADFF2F", "#E63000", "#8B3A00",
-                             "#1A6B1A", "#8B00CC",
-                             "#FF69B4", "#6A5ACD", "#1E5FCC"),
+                  col    = c("#aaff01", "#f02b00", "#7a4101",
+                             "#0a9e00", "#9f0aef",
+                             "#f54b8c", "#ae5504", "#0000fe"),
                   pch = 19, bty = "n", cex = 1.1)
   invisible(ds)
 }
 
-# compute_xi_label(): derive Xi 2023 8-class composite label from pipeline columns.
+# forest_component_labels(): derive 8-class forest fuel component label per point.
 # Uses: Classification (ground), TreeFilterLabel (overstory mask),
-#       StemCls (stem detection), WoodLabel (wood/foliage).
+#       StemCls (stem detection), WoodLabel (wood/foliage), DownedLog (PCA tilt).
 # Class 4 (downed logs): wood points near ground (Z <= downed_z_max) with
 # horizontal primary PCA axis (tilt > downed_tilt_min_deg); written to
 # las@data$DownedLog by Section 4, read here via the has_dl guard.
-compute_xi_label <- function(ds) {
+forest_component_labels <- function(ds) {
   if (inherits(ds, "LAS")) ds <- ds@data
   n   <- nrow(ds)
   lbl <- integer(n)   # default 0 = grass/remaining
@@ -1708,7 +1707,7 @@ las <- switch(method,
 # ============================================================================
 # WoodCls separates wood (branches + trunk, label>=2) from foliage (label=1)
 # on the FULL cloud (overstory + understory). TreeFilterLabel is used afterward
-# in compute_xi_label() to assign the correct Xi class:
+# in forest_component_labels() to assign the correct Xi class:
 #   overstory wood  -> class 2 (branch) or class 1 (stem, via StemCls)
 #   understory wood -> class 6 (below-canopy branch) or class 5 (sapling stem)
 # The QSM step (Section 9) still uses only overstory WoodLabel==2 points.
@@ -1738,7 +1737,7 @@ if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
   # -- Downed log detection (Xi class 4) ------------------------------------
   # Wood points near the ground (Z <= downed_z_max) whose local 3D neighbourhood
   # has a predominantly horizontal primary axis are flagged as downed logs.
-  # Written to las@data$DownedLog (logical); compute_xi_label() reads it.
+  # Written to las@data$DownedLog (logical); forest_component_labels() reads it.
   if (isTRUE(tls_params$downed_log_enable) &&
       requireNamespace("RANN", quietly = TRUE)) {
     dl_z_max  <- as.numeric(tls_params$downed_z_max)
