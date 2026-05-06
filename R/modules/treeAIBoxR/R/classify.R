@@ -66,9 +66,26 @@ classify_wood <- function(xyz, model, if_bottom_only = FALSE,
   #   pcd_pred[~seen] = True  then return (pcd_pred + 1))
   if (isTRUE(if_bottom_only)) seen <- logical(plan$n_pts)
 
+  # In-place progress bar: uses \r to overwrite the same console line.
+  # Only active when verbose=FALSE and there is more than one block.
+  # verbose=TRUE keeps the existing per-block detail messages instead.
+  .pb <- if (!verbose && nblk > 1L) {
+    function(i) {
+      filled <- round(30L * i / nblk)
+      cat(sprintf("\r  [%s] %3d%%  (%d/%d blocks)",
+                  paste0(strrep("=", filled), strrep(" ", 30L - filled)),
+                  round(100L * i / nblk), i, nblk),
+          file = stderr())
+      if (i == nblk) cat("\n", file = stderr())
+    }
+  } else {
+    function(i) invisible(NULL)
+  }
+
   for (i in seq_len(nblk)) {
     blk     <- plan$blocks[[i]]
     occ_idx <- blk$occ_idx                    # 1-based, length n_unique_voxels
+    .pb(i)
     if (length(occ_idx) == 0L) next
 
     # Build a flat occupancy tensor of length D*H*W, set occupied voxels to 1.
