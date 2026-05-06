@@ -497,13 +497,15 @@ tls_params <- list(
   # is predominantly horizontal (primary PCA axis tilted > downed_tilt_min_deg
   # from vertical) are flagged as downed logs.
   # Z is height above ground (already normalized in Section 2.1).
-  downed_log_enable   = TRUE,   # FALSE to skip and leave class 4 unpopulated
-  downed_z_max        = 1.5,    # m above ground; candidates above this are skipped
-  downed_knn_radius   = 0.3,    # m; 3D radius for PCA neighbourhood
-  downed_knn_min_pts  = 5L,     # minimum neighbours for reliable PCA
-  downed_tilt_min_deg = 60.0,   # primary eigenvector tilt from vertical (degrees)
-                                 # Xi 2023: >60° clearly demarcates leaning tree
-                                 # layer from downed woody debris layer
+  downed_log_enable    = TRUE,   # FALSE to skip and leave class 4 unpopulated
+  downed_z_max         = 1.5,    # m above ground; candidates above this are skipped
+  downed_knn_radius    = 0.5,    # m; 3D radius for PCA neighbourhood (wood-only)
+  downed_knn_min_pts   = 8L,     # minimum wood neighbours for reliable PCA
+  downed_tilt_min_deg  = 60.0,   # primary eigenvector tilt from vertical (degrees)
+                                  # Xi 2023: >60° clearly demarcates leaning tree
+                                  # layer from downed woody debris layer
+  downed_linearity_min = 0.5,    # (d1-d2)/d1 of PCA singular values; filters shrubs
+                                  # and stem bases which are planar/isotropic
 
   # --- Section 9: QSM (TreeAIBox) -----------------------------------------
   # Builds a Quantitative Structure Model per tree using the applyQSM
@@ -1749,10 +1751,11 @@ if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
   # Written to las@data$DownedLog (logical); forest_component_labels() reads it.
   if (isTRUE(tls_params$downed_log_enable) &&
       requireNamespace("RANN", quietly = TRUE)) {
-    dl_z_max  <- as.numeric(tls_params$downed_z_max)
-    dl_radius <- as.numeric(tls_params$downed_knn_radius)
-    dl_min_n  <- as.integer(tls_params$downed_knn_min_pts)
-    dl_tilt   <- as.numeric(tls_params$downed_tilt_min_deg)
+    dl_z_max    <- as.numeric(tls_params$downed_z_max)
+    dl_radius   <- as.numeric(tls_params$downed_knn_radius)
+    dl_min_n    <- as.integer(tls_params$downed_knn_min_pts)
+    dl_tilt     <- as.numeric(tls_params$downed_tilt_min_deg)
+    dl_lin      <- as.numeric(tls_params$downed_linearity_min)
     # Candidate = non-ground wood point near ground
     dl_cand <- which(las@data$WoodLabel >= 2L &
                      las@data$Classification != 2L &
@@ -1762,24 +1765,35 @@ if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
       message(sprintf("[4] Downed log: PCA on %d near-ground wood candidates...",
                       length(dl_cand)))
       xyz_all  <- as.matrix(las@data[, c("X", "Y", "Z")])
+      # Wood-only index (used to restrict PCA neighbourhood)
+      is_wood  <- las@data$WoodLabel >= 2L & las@data$Classification != 2L
       xyz_cand <- xyz_all[dl_cand, , drop = FALSE]
-      # kNN within radius: search all points as reference, query candidates
+      # kNN within radius: search ALL points as reference so radius is in scene
+      # units; the returned indices are then filtered to wood-only before PCA.
       nn_idx <- RANN::nn2(xyz_all, xyz_cand,
-                          k = min(50L, nrow(xyz_all)),
+                          k = min(100L, nrow(xyz_all)),
                           searchtype = "radius",
                           radius = dl_radius)$nn.idx
       is_downed <- logical(length(dl_cand))
       for (i in seq_along(dl_cand)) {
         nbrs <- nn_idx[i, ]
         nbrs <- nbrs[nbrs > 0L]
+        # Restrict to wood points only: prevents ground plane from pulling
+        # the primary PCA axis horizontal at standing stem bases.
+        nbrs <- nbrs[is_wood[nbrs]]
         if (length(nbrs) < dl_min_n) next
         nb_xyz <- xyz_all[nbrs, , drop = FALSE]
         nb_xyz <- sweep(nb_xyz, 2L, colMeans(nb_xyz))
-        sv <- svd(nb_xyz, nu = 0L, nv = 1L)$v[, 1L]  # primary axis
-        # Angle between primary axis and vertical [0,0,1]
-        cos_a  <- abs(sv[3L]) / sqrt(sum(sv^2))
+        sv_res <- svd(nb_xyz, nu = 0L, nv = 1L)
+        sv     <- sv_res$v[, 1L]          # primary axis direction
+        d      <- sv_res$d                # singular values (all 3)
+        # Tilt: angle between primary axis and vertical [0,0,1]
+        cos_a    <- abs(sv[3L]) / sqrt(sum(sv^2))
         tilt_deg <- acos(pmin(1.0, cos_a)) * 180.0 / pi
-        is_downed[i] <- tilt_deg >= dl_tilt
+        # Linearity: (d1-d2)/d1 — high for elongated log, low for shrub junctions
+        # and stem cross-sections (planar/isotropic). Guards against false positives.
+        linearity <- if (d[1L] > 0) (d[1L] - d[2L]) / d[1L] else 0.0
+        is_downed[i] <- tilt_deg >= dl_tilt && linearity >= dl_lin
       }
       las@data$DownedLog[dl_cand] <- is_downed
       message(sprintf("[4] Downed log: %d / %d candidates flagged as downed (%.1f%%).",
