@@ -325,9 +325,13 @@ tls_params <- list(
   treeisonet_treefilter_model   = "treefiltering_tls_esegformer3D_128_8cm(GPU3GB)",
   treeisonet_treefilter_device  = "auto",         # "auto" | "cuda" | "cpu"
   # if_bottom_only: use 2D XY-only sliding blocks (TRUE) or full 3D (FALSE).
-  # ALS/UAV models: TRUE (no vertical structure; matches GUI default for ALS).
-  # TLS models:     FALSE (full 3D inference; taller voxel columns needed).
-  treeisonet_treefilter_bottom_only = FALSE,
+  # TRUE:  classify each XY column using only the bottom 10.24 m (trunk region),
+  #        then auto-mark ALL points above 10.24 m as overstory.  Correct for
+  #        TLS when trees exceed one block height (~10 m); avoids sparse treetop
+  #        blocks being misclassified as understory by the 3-D sliding window.
+  # FALSE: full 3-D sliding; upper crown blocks are sparse and may appear as
+  #        understory, causing a hard cutoff at the top of the last block.
+  treeisonet_treefilter_bottom_only = TRUE,
 
   # --- TreeisoNet knobs (used when seg_method == "treeisonet") -------------
   # Deep-learning individual tree segmentation pipeline (Xi et al. 2023):
