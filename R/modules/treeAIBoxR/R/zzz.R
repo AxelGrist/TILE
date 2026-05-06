@@ -27,3 +27,16 @@
   }
   invisible(NULL)
 }
+
+.onAttach <- function(libname, pkgname) {
+  # Download any missing models to the local cache.  Files that already exist
+  # are skipped instantly, so this is a no-op after the first library() call.
+  tryCatch(
+    download_all_models(verbose = TRUE),
+    error = function(e)
+      packageStartupMessage(
+        "[treeAIBoxR] Model download failed (no internet?): ",
+        conditionMessage(e))
+  )
+  invisible(NULL)
+}
