@@ -598,6 +598,21 @@ plot_cloud_qc <- function(pts,
     pal <- grDevices::hcl.colors(60, "Dark 3")
     ifelse(is.na(ds$TreeID), "grey80",
            pal[((ds$TreeID - 1L) %% length(pal)) + 1L])
+  } else if (color_by == "WoodLabel" && "WoodLabel" %in% names(ds)) {
+    ifelse(is.na(ds$WoodLabel), "grey80",
+           ifelse(ds$WoodLabel >= 2L, "saddlebrown", "forestgreen"))
+  } else if (color_by == "XiLabel") {
+    # Xi 2023 8-class palette (classes 4-6 merged into 0 until extra models added)
+    xi_pal <- c("0" = "#ADFF2F",   # Grass/remaining  (yellow-green)
+                "1" = "#E63000",   # Stem             (red)
+                "2" = "#8B3A00",   # Branch           (reddish-brown)
+                "3" = "#1A6B1A",   # Foliage          (forest green)
+                "4" = "#8B00CC",   # Downed woody log (purple)   -- reserved
+                "5" = "#FF69B4",   # Sapling stem     (pink)     -- reserved
+                "6" = "#6A5ACD",   # Below-canopy br. (slate blue) -- reserved
+                "7" = "#1E5FCC")   # Ground           (blue)
+    lbl <- compute_xi_label(ds)
+    xi_pal[as.character(lbl)]
   } else if (color_by == "Classification" && "Classification" %in% names(ds)) {
     ifelse(ds$Classification == 2L, "saddlebrown", "forestgreen")
   } else if (color_by == "Z") {
@@ -611,12 +626,70 @@ plot_cloud_qc <- function(pts,
   rgl::points3d(ds$X, ds$Y, ds$Z, color = col, size = point_size)
   rgl::aspect3d("iso")
   rgl::axes3d(c("x--", "y--", "z--"), col = "grey40")
-  if (!is.null(title)) rgl::title3d(main = title, col = "black")
+  if (!is.null(title)) rgl::title3d(main = iconv(title, to = "ASCII//TRANSLIT"), col = "black")
   if (!is.null(mask))
     rgl::legend3d("topright",
                   legend = c("target (mask=TRUE)", "rest"),
                   col = c("#D62728", "#2CA02C"), pch = 19, bty = "n")
+  if (color_by == "XiLabel")
+    rgl::legend3d("topright",
+                  legend = c("0 Grass/remaining", "1 Stem", "2 Branch",
+                             "3 Foliage", "5 Sapling stem",
+                             "6 Below-canopy branch", "7 Ground"),
+                  col    = c("#ADFF2F", "#E63000", "#8B3A00",
+                             "#1A6B1A", "#FF69B4",
+                             "#6A5ACD", "#1E5FCC"),
+                  pch = 19, bty = "n", cex = 1.1)
   invisible(ds)
+}
+
+# compute_xi_label(): derive Xi 2023 8-class composite label from pipeline columns.
+# Uses: Classification (ground), TreeFilterLabel (overstory mask),
+#       StemCls (stem detection), WoodLabel (wood/foliage).
+# Classes 4/5/6 (downed logs, saplings, below-canopy branches) are not yet
+# distinguishable and remain in class 0 (Grass/remaining).
+compute_xi_label <- function(ds) {
+  if (inherits(ds, "LAS")) ds <- ds@data
+  n   <- nrow(ds)
+  lbl <- integer(n)   # default 0 = grass/remaining
+
+  # Ground (LAS class 2)
+  if ("Classification" %in% names(ds))
+    lbl[ds$Classification == 2L] <- 7L
+  not_ground <- lbl != 7L
+
+  has_tf  <- "TreeFilterLabel" %in% names(ds)
+  has_wc  <- "WoodLabel"       %in% names(ds)
+  has_sc  <- "StemCls"         %in% names(ds)
+
+  ov <- not_ground & if (has_tf) ds$TreeFilterLabel == 2L else rep(TRUE, n)
+  us <- not_ground & if (has_tf) ds$TreeFilterLabel == 1L else rep(FALSE, n)
+
+  # ---- Overstory ----
+  # Foliage: overstory + WoodLabel == 1
+  if (has_wc) lbl[ov & ds$WoodLabel == 1L] <- 3L
+
+  # Branch: overstory + wood + not stem
+  if (has_wc && has_sc)
+    lbl[ov & ds$WoodLabel >= 2L & ds$StemCls != 2L] <- 2L
+  else if (has_wc)
+    lbl[ov & ds$WoodLabel >= 2L] <- 2L
+
+  # Stem: overstory + StemCls == 2 (highest overstory priority)
+  if (has_sc) lbl[ov & ds$StemCls == 2L] <- 1L
+
+  # ---- Understory ----
+  # Below-canopy foliage stays 0 (grass/remaining)
+  # Below-canopy branch: understory + WoodLabel >= 2 + not sapling stem
+  if (has_wc && has_sc)
+    lbl[us & ds$WoodLabel >= 2L & ds$StemCls != 2L] <- 6L
+  else if (has_wc)
+    lbl[us & ds$WoodLabel >= 2L] <- 6L
+
+  # Sapling stem: understory + StemCls == 2 (highest understory priority)
+  if (has_sc) lbl[us & ds$StemCls == 2L] <- 5L
+
+  lbl
 }
 
 
@@ -1547,6 +1620,13 @@ segment_trees_treeisonet <- function(las, tls_params) {
   # StemCls: written for QSM use. 1=foliage/branch, 2=stem.
   # Also written for ALS path (stemcls not computed; stays 1 throughout).
   las@data$StemCls <- full_stemcls
+  # TreeFilterLabel: 2L = overstory (passed to WoodCls / QSM), 1L = understory/ground.
+  # NA when TreeFilter was not run (all points treated as overstory downstream).
+  if (!is.null(treefilter_idx)) {
+    tfl <- integer(n_full) + 1L
+    tfl[treefilter_idx] <- 2L
+    las@data$TreeFilterLabel <- tfl
+  }
   las
 }
 
@@ -1603,35 +1683,72 @@ las <- switch(method,
 )
 
 
-# 4. WoodCls  (wood / foliage classification)
+# 4. WoodCls  (wood / foliage classification)  +  understory StemCls
 # ============================================================================
-# Separates wood points (branches + trunk, label=2) from foliage (label=1)
-# using a supervised DL classifier (ESegFormer3D) and writes the result to
-# las@data$WoodLabel.  The QSM step (Section 9) uses WoodLabel==2 as input.
-# Skip by setting tls_params$woodcls_model = NA_character_.
+# WoodCls separates wood (branches + trunk, label>=2) from foliage (label=1)
+# on the FULL cloud (overstory + understory). TreeFilterLabel is used afterward
+# in compute_xi_label() to assign the correct Xi class:
+#   overstory wood  -> class 2 (branch) or class 1 (stem, via StemCls)
+#   understory wood -> class 6 (below-canopy branch) or class 5 (sapling stem)
+# The QSM step (Section 9) still uses only overstory WoodLabel==2 points.
+# Skip WoodCls by setting tls_params$woodcls_model = NA_character_.
 
 if (!is.na(tls_params$woodcls_model) && nzchar(tls_params$woodcls_model)) {
   wc_device <- if (identical(tls_params$woodcls_device, "auto")) {
     if (torch::cuda_is_available()) "cuda" else "cpu"
   } else tls_params$woodcls_device
 
-  message(sprintf("[7] WoodCls: loading model '%s' on %s...",
+  message(sprintf("[4] WoodCls: loading model '%s' on %s...",
                   tls_params$woodcls_model, wc_device))
   wc_bundle  <- treeAIBoxR::load_treeaibox_model(
     model_name = tls_params$woodcls_model, device = wc_device)
 
+  # Run on the full cloud so understory wood is also labelled (Xi classes 5/6).
   wc_pts <- as.matrix(las@data[, c("X", "Y", "Z")])
-  message(sprintf("[7] WoodCls: classifying %d points...", nrow(wc_pts)))
+  message(sprintf("[4] WoodCls: classifying %d points (full cloud)...", nrow(wc_pts)))
   wc_labels <- treeAIBoxR::classify_wood(wc_pts, wc_bundle, verbose = FALSE)
   las@data$WoodLabel <- as.integer(wc_labels)
 
   n_wood <- sum(wc_labels >= 2L)
-  message(sprintf("[7] WoodCls done: %d / %d wood points (%.1f%%).",
-                  n_wood, nrow(wc_pts),
-                  100 * n_wood / nrow(wc_pts)))
+  message(sprintf("[4] WoodCls done: %d / %d points classified as wood (%.1f%%).",
+                  n_wood, nrow(wc_pts), 100 * n_wood / nrow(wc_pts)))
   rm(wc_pts, wc_bundle, wc_labels); invisible(gc())
+
+  # -- Understory StemCls pass ----------------------------------------------
+  # Run the same StemCls model on understory points (TreeFilterLabel==1) so
+  # sapling stems (Xi class 5) can be distinguished from below-canopy branches
+  # (Xi class 6). Overstory StemCls was already written to las@data$StemCls by
+  # segment_trees_treeisonet(); only understory rows are updated here.
+  us_stemcls_model <- tls_params$treeisonet_stemcls_model
+  has_treefilter   <- "TreeFilterLabel" %in% names(las@data)
+  if (!is.na(us_stemcls_model) && nzchar(us_stemcls_model) && has_treefilter) {
+    us_idx <- which(las@data$TreeFilterLabel == 1L &
+                    las@data$Classification != 2L)   # non-ground understory
+    if (length(us_idx) > 0L) {
+      message(sprintf("[4] Understory StemCls: classifying %d understory points...",
+                      length(us_idx)))
+      sc_device <- if (identical(tls_params$treeisonet_device, "auto")) {
+        if (torch::cuda_is_available()) "cuda" else "cpu"
+      } else tls_params$treeisonet_device
+      sc_bundle <- treeAIBoxR::load_treeaibox_model(
+        model_name = us_stemcls_model, device = sc_device)
+      us_pts    <- as.matrix(las@data[us_idx, c("X", "Y", "Z")])
+      us_labels <- treeAIBoxR::classify_wood(us_pts, sc_bundle, verbose = FALSE)
+      # Only update understory rows; overstory StemCls stays intact.
+      las@data$StemCls[us_idx] <- as.integer(us_labels)
+      n_us_stem <- sum(us_labels >= 2L)
+      message(sprintf("[4] Understory StemCls done: %d / %d understory stem points (%.1f%%).",
+                      n_us_stem, length(us_idx),
+                      100 * n_us_stem / length(us_idx)))
+      rm(us_pts, sc_bundle, us_labels, us_idx); invisible(gc())
+    } else {
+      message("[4] Understory StemCls skipped: no non-ground understory points found.")
+    }
+  } else if (!has_treefilter) {
+    message("[4] Understory StemCls skipped: TreeFilter was not run (no TreeFilterLabel column).")
+  }
 } else {
-  message("[7] WoodCls skipped (tls_params$woodcls_model is NA).")
+  message("[4] WoodCls skipped (tls_params$woodcls_model is NA).")
   # Write a default WoodLabel of 2 (all points treated as wood) so Section 9
   # can still run if manually triggered with woodcls_model = NA.
   if (!"WoodLabel" %in% names(las@data))
@@ -1651,15 +1768,21 @@ if (isTRUE(tls_params$tree_qc_enable)) {
   if (dir.exists(qc_dir))
     invisible(file.remove(list.files(qc_dir, pattern = "\\.png$", full.names = TRUE)))
   dir.create(qc_dir, showWarnings = FALSE, recursive = TRUE)
-  qc_las <- if (exists("las_seg")) las_seg else
-            lidR::filter_poi(las, TreeID %in% inv$TreeID)
+  has_inv <- exists("inv") && is.data.frame(inv)
+  qc_las <- if (exists("las_seg")) las_seg else if (has_inv)
+    lidR::filter_poi(las, TreeID %in% inv$TreeID) else
+    lidR::filter_poi(las, !is.na(TreeID) & TreeID > 0L)
   data.table::setDT(qc_las@data)
   qc_ids <- sort(unique(qc_las@data$TreeID))
   qc_ids <- qc_ids[!is.na(qc_ids)]
   if (!is.na(tls_params$tree_qc_top_n) &&
       tls_params$tree_qc_top_n < length(qc_ids)) {
-    ord <- order(-inv$DBH[match(qc_ids, inv$TreeID)], na.last = TRUE)
-    qc_ids <- qc_ids[ord][seq_len(tls_params$tree_qc_top_n)]
+    if (has_inv) {
+      ord <- order(-inv$DBH[match(qc_ids, inv$TreeID)], na.last = TRUE)
+      qc_ids <- qc_ids[ord][seq_len(tls_params$tree_qc_top_n)]
+    } else {
+      qc_ids <- qc_ids[seq_len(tls_params$tree_qc_top_n)]
+    }
   }
   hw <- tls_params$tree_qc_xy_halfwidth
   has_rgb <- isTRUE(tls_params$tree_qc_use_rgb) &&
@@ -1688,9 +1811,9 @@ if (isTRUE(tls_params$tree_qc_enable)) {
   for (id in qc_ids) {
     pts <- qc_las@data[TreeID == id]
     if (nrow(pts) < tls_params$tree_qc_min_points) next
-    inv_row <- inv[inv$TreeID == id, ]
-    dbh <- if (nrow(inv_row)) inv_row$DBH[1]    else NA_real_
-    ht  <- if (nrow(inv_row)) inv_row$Height[1] else NA_real_
+    inv_row <- if (has_inv) inv[inv$TreeID == id, ] else data.frame()
+    dbh <- if (nrow(inv_row) && "DBH"    %in% names(inv_row)) inv_row$DBH[1]    else NA_real_
+    ht  <- if (nrow(inv_row) && "Height" %in% names(inv_row)) inv_row$Height[1] else NA_real_
     fid <- if (nrow(inv_row) && "f_id" %in% names(inv_row)) inv_row$f_id[1] else NA
     cx  <- median(pts$X); cy <- median(pts$Y)
     if (has_rgb) {
@@ -1915,8 +2038,8 @@ if (interactive()) {
   # 5b. Full-plot QC -------------------------------------------------------
   # rgl view of the entire segmented cloud. For mask-based QC overlays:
   #   plot_cloud_qc(las, mask = drop_mask)
-  plot_cloud_qc(las, color_by = "TreeID",
-                title = "Segmented cloud (color = TreeID)")
+  plot_cloud_qc(las, color_by = "XiLabel",
+                title = "Point decomposition (Xi 2023 classes)")
 }
 
 
