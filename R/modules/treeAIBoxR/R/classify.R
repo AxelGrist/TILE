@@ -104,8 +104,11 @@ classify_wood <- function(xyz, model, if_bottom_only = FALSE,
     if (is_multi) {
       pcd_pred[blk$pcd_idx] <- point_labels
     } else {
-      # Binary mode: any block voting "wood" wins (matches upstream OR).
-      pcd_pred[blk$pcd_idx] <- pcd_pred[blk$pcd_idx] | (point_labels > 1L)
+      # Binary mode: upstream Python uses 0-based argmax with `nb_pred > 1`,
+      # keeping only the highest class (Python class 2 = tree/stem).
+      # R torch_argmax is 1-based, so Python class 2 = R class 3.
+      # Use > 2L (not > 1L) to match Python exactly.
+      pcd_pred[blk$pcd_idx] <- pcd_pred[blk$pcd_idx] | (point_labels > 2L)
     }
 
     if (isTRUE(if_bottom_only)) seen[blk$pcd_idx] <- TRUE
