@@ -493,19 +493,24 @@ tls_params <- list(
   woodcls_device = "auto",   # "auto" | "cuda" | "cpu"
 
   # --- Section 4b: Downed log detection (Xi class 4) ----------------------
-  # Wood points (WoodLabel >= 2) near the ground whose local neighborhood
-  # is predominantly horizontal (primary PCA axis tilted > downed_tilt_min_deg
-  # from vertical) are flagged as downed logs.
+  # Xi 2023 identifies downed logs using the WoodCls SegFormer as a binary
+  # classifier on near-ground points (if_bottom_only=True, 2D XY voxelisation)
+  # combined with an inclination-angle criterion. No dedicated pre-trained
+  # downed-log model is publicly available, so we approximate with a PCA
+  # geometric test on the wood-only neighbourhood of each candidate point.
   # Z is height above ground (already normalized in Section 2.1).
   downed_log_enable    = TRUE,   # FALSE to skip and leave class 4 unpopulated
   downed_z_max         = 1.5,    # m above ground; candidates above this are skipped
   downed_knn_radius    = 0.5,    # m; 3D radius for PCA neighbourhood (wood-only)
+                                  # Not specified in paper; tune to log diameter
   downed_knn_min_pts   = 8L,     # minimum wood neighbours for reliable PCA
+                                  # Not specified in paper; increase for noisier scans
   downed_tilt_min_deg  = 60.0,   # primary eigenvector tilt from vertical (degrees)
-                                  # Xi 2023: >60° clearly demarcates leaning tree
-                                  # layer from downed woody debris layer
-  downed_linearity_min = 0.5,    # (d1-d2)/d1 of PCA singular values; filters shrubs
-                                  # and stem bases which are planar/isotropic
+                                  # Xi 2023: ">60° clearly demarcates the leaning
+                                  # tree layer from the downed woody debris layer"
+  downed_linearity_min = 0.5,    # (d1-d2)/d1 of PCA singular values
+                                  # Not in paper; our addition to reject shrub branch
+                                  # junctions and stem bases (planar/isotropic nbhd)
 
   # --- Section 9: QSM (TreeAIBox) -----------------------------------------
   # Builds a Quantitative Structure Model per tree using the applyQSM
