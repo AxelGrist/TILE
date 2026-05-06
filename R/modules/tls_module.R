@@ -84,8 +84,7 @@ tls_params <- list(
   csf_rigidness        = 3L,
   csf_sloop_smooth     = TRUE,
   csf_time_step        = 0.65,
-  z_min                = 0.2,    # m; height filter post-normalize
-  z_max                = 50,
+  z_max                = 50,     # m; hard ceiling after height normalization
   # SOR: drop points whose mean k-NN distance is > m * sd above cloud-wide mean.
   sor_k                = 8,
   sor_m                = 3,      # lower = more aggressive
@@ -786,9 +785,9 @@ las <- classify_ground(las, csf(
 ))
 
 las <- normalize_height(las, tin())
-# Keep ground-classified points regardless of z_min: after normalize_height
-# they sit at Z ~ 0, which is below the z_min noise floor (0.2 m default).
-las <- filter_poi(las, Classification == 2L | (Z >= tls_params$z_min & Z <= tls_params$z_max))
+# Drop only points above the hard ceiling; ground and all near-ground points
+# are kept. CSF already classified the ground and SOR removes scanner noise.
+las <- filter_poi(las, Z <= tls_params$z_max)
 
 # 2.2 Statistical outlier removal --------------------------------------------
 # Drop scanner ghost / mixed-pixel noise. add_geometry() and density-raster
