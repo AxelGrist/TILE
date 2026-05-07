@@ -1627,32 +1627,26 @@ segment_trees_treeisonet <- function(las, tls_params) {
 
     # Step 4: CrownOff3D → assign foliage / branches that shortestpath3D
     # could not reach (only stems get TreeID from the graph).
+    # Uses treeisonet_run_crownoff() which mirrors crownOff.py exactly:
+    #   channel 1 = per-3D-voxel mean of stem_cls (NOT 2D treeloc broadcast),
+    #   output = 3D (dx,dy,dz) offsets, post-processing = mergeshift + mergeremain.
     crownoff_name <- tls_params$treeisonet_crownoff_model
     if (!is.na(crownoff_name) && nzchar(crownoff_name)) {
-      crown_idx <- which(tree_ids == 0L)   # points not yet assigned
-      if (length(crown_idx) > 0L) {
+      n_unassigned <- sum(tree_ids == 0L)
+      if (n_unassigned > 0L) {
         message(sprintf("  [4/4] CrownOff3D: %d unassigned points -> loading model '%s'...",
-                        length(crown_idx), crownoff_name))
+                        n_unassigned, crownoff_name))
         crownoff_bundle <- treeAIBoxR::load_treeaibox_model(
           model_name = crownoff_name, device = device)
-        # Run CrownOff on the full point set; model uses treeloc context
-        # to predict per-point XY offset to the nearest tree crown centre.
-        crown_offsets <- treeAIBoxR::treeisonet_run_treeoff(
+        tree_ids <- treeAIBoxR::treeisonet_run_crownoff(
           xyz          = pts,
-          treelocs     = base_locs,
+          tree_ids     = tree_ids,
           model_bundle = crownoff_bundle,
           vox_override = vox_override,
           verbose      = TRUE)
-        crown_ids <- treeAIBoxR::treeisonet_mergeshift(
-          xyz      = pts,
-          offsets  = crown_offsets,
-          treelocs = base_locs)
-        # Only overwrite points still unassigned after shortestpath3D.
-        tree_ids[crown_idx] <- crown_ids[crown_idx]
-        n_crown_assigned <- sum(tree_ids[crown_idx] > 0L)
-        message(sprintf("  [4/4] CrownOff3D done: %d / %d previously-unassigned points now have a TreeID.",
-                        n_crown_assigned, length(crown_idx)))
-        rm(crownoff_bundle, crown_offsets, crown_ids, crown_idx)
+        message(sprintf("  [4/4] CrownOff3D done: %d / %d points have a TreeID.",
+                        sum(tree_ids > 0L), length(tree_ids)))
+        rm(crownoff_bundle)
       } else {
         message("  [4/4] CrownOff3D: all points already assigned; step skipped.")
       }

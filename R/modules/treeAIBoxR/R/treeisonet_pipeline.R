@@ -753,3 +753,209 @@ treeisonet_mergeshift <- function(xyz, offsets, treelocs) {
   nn <- RANN::nn2(treelocs[, 1:2L, drop = FALSE], xyz_shifted, k = 1L)
   as.integer(nn$nn.idx[, 1L])
 }
+
+# --------------------------------------------------------------------------
+# treeisonet_run_crownoff  (TLS / UAV scene — crown assignment after stems)
+# --------------------------------------------------------------------------
+
+# Port of crownOff.mergeshift().  Shifts ALL points (both already-assigned
+# stem points and unassigned crown/foliage points) by their predicted 3D
+# offset, then assigns each unassigned point to the nearest already-assigned
+# stem point in 3D.  Assigned points keep their existing tree ID unchanged.
+#
+# @param shifted_xyz  numeric matrix (n,3): original XYZ + predicted offsets.
+# @param stem_cls     integer vector (n): 1 = already assigned, 0 = unassigned.
+# @param tree_ids     integer vector (n): existing tree IDs (0 for unassigned).
+# @return integer vector (n): tree IDs; unassigned points now inherit the ID
+#   of their nearest shifted stem point.
+.crownoff_mergeshift <- function(shifted_xyz, stem_cls, tree_ids) {
+  seg_labels <- integer(nrow(shifted_xyz))
+  stem_ind   <- stem_cls > 0L
+  if (!any(stem_ind)) return(seg_labels)
+  seg_labels[stem_ind] <- tree_ids[stem_ind]
+  if (!any(!stem_ind))  return(seg_labels)
+  nn <- RANN::nn2(shifted_xyz[ stem_ind, 1:3L, drop = FALSE],
+                  shifted_xyz[!stem_ind, 1:3L, drop = FALSE], k = 1L)
+  seg_labels[!stem_ind] <- tree_ids[stem_ind][nn$nn.idx[, 1L]]
+  seg_labels
+}
+
+# Port of crownOff.mergeremain().  After mergeshift there may still be
+# isolated points whose shifted position landed far from any stem (e.g.,
+# occluded upper crown).  Voxel-downsample at dec_res metres, fill
+# remaining unassigned voxels by nearest-neighbour from assigned voxels,
+# then propagate labels back to the full cloud.
+#
+# @param xyz          numeric matrix (n,3): ORIGINAL (un-shifted) XYZ.
+# @param init_labels  integer vector (n): output of .crownoff_mergeshift().
+# @param dec_res      numeric: voxel edge for downsampling before NN fill (m).
+# @return integer vector (n): fully-filled tree IDs.
+.crownoff_mergeremain <- function(xyz, init_labels, dec_res = 0.2) {
+  xyz_min  <- apply(xyz, 2L, min)
+  vox      <- floor((xyz - rep(xyz_min, each = nrow(xyz))) / dec_res)
+  vox_key  <- paste(vox[, 1L], vox[, 2L], vox[, 3L], sep = ":")
+  u_idx    <- which(!duplicated(vox_key))   # one representative per voxel
+  grp_idx  <- match(vox_key, vox_key[u_idx])  # inverse map back to full cloud
+
+  xyz_dec    <- xyz[u_idx, 1:3L, drop = FALSE]
+  label_dec  <- init_labels[u_idx]
+  seg_labels <- integer(length(u_idx))
+
+  exist_ind <- label_dec > 0L
+  if (any(exist_ind) && any(!exist_ind)) {
+    nn <- RANN::nn2(xyz_dec[ exist_ind, , drop = FALSE],
+                    xyz_dec[!exist_ind, , drop = FALSE], k = 1L)
+    seg_labels[!exist_ind] <- label_dec[exist_ind][nn$nn.idx[, 1L]]
+  }
+  seg_labels[exist_ind] <- label_dec[exist_ind]
+  seg_labels[grp_idx]
+}
+
+#' Assign tree IDs to crown/foliage points using the CrownOff regression model.
+#'
+#' R port of \code{crownOff.crownOff()} from TreeAIBox.  This is the TLS/UAV
+#' equivalent of \code{treeisonet_run_treeoff()}, used as step 4 in the
+#' TreeisoNet pipeline after \code{treeisonet_shortestpath3D()} has assigned
+#' IDs to stem points only.
+#'
+#' The key difference from the ALS treeOff model is \strong{channel 1}:
+#' \itemize{
+#'   \item treeOff (ALS): channel 1 = 2D treeloc indicator broadcast along Z.
+#'   \item crownOff (TLS): channel 1 = per-3D-voxel mean of \code{stem_cls}
+#'         (binary flag marking voxels that contain already-assigned stem
+#'         points from \code{shortestpath3D}).  This gives the model a 3D
+#'         map of existing stem segments as context for predicting where each
+#'         crown point belongs.
+#' }
+#' After inference the function applies two post-processing steps that also
+#' differ from treeOff:
+#' \enumerate{
+#'   \item \strong{mergeshift}: shift every point by its predicted 3D
+#'         (dx,dy,dz) offset, then assign each unassigned point to the
+#'         nearest already-assigned (stem) point in 3D.
+#'   \item \strong{mergeremain}: fill any still-unassigned points by
+#'         nearest-neighbour after 0.2 m voxel downsampling.
+#' }
+#'
+#' @param xyz          numeric matrix (n, 3) of all point XYZ (full cloud,
+#'   including already-assigned stem points).
+#' @param tree_ids     integer vector (n): per-point tree ID from
+#'   \code{treeisonet_shortestpath3D()}; 0 = unassigned (foliage/crown).
+#' @param model_bundle list from \code{load_treeaibox_model()} for a
+#'   \code{crownoff} model (\code{head_type="regression"}, \code{out_chans=3}).
+#' @param vox_override optional list with named elements \code{xy} and/or
+#'   \code{z} to override the model's voxel resolution (metres).
+#' @param verbose      print per-block progress bar.
+#' @return integer vector (n): tree IDs for all points.  Stem-point IDs from
+#'   \code{tree_ids} are preserved unchanged; crown points receive IDs via
+#'   mergeshift + mergeremain.  Residual zeros are rare (truly isolated pts).
+#' @export
+treeisonet_run_crownoff <- function(xyz, tree_ids, model_bundle,
+                                    vox_override = NULL, verbose = FALSE) {
+  if (!requireNamespace("RANN", quietly = TRUE))
+    stop("treeisonet_run_crownoff() requires the RANN package.")
+
+  model    <- model_bundle$model
+  device   <- model_bundle$device
+  cfg      <- model_bundle$config$model
+  nbmat_sz <- as.integer(cfg$voxel_number_in_block)   # c(X, Y, Z)
+  min_res  <- as.numeric(cfg$voxel_resolution_in_meter)
+  if (!is.null(vox_override$xy) && !is.na(vox_override$xy))
+    min_res[1:2L] <- as.numeric(vox_override$xy)
+  if (!is.null(vox_override$z) && !is.na(vox_override$z))
+    min_res[3L] <- as.numeric(vox_override$z)
+  nb_tsz <- prod(nbmat_sz)
+
+  # Binary stem flag: 1 = already assigned by shortestpath3D, 0 = crown/foliage.
+  # This is the context signal fed as channel 1 to the model.
+  stem_cls <- as.integer(tree_ids > 0L)
+
+  pcd_min <- apply(xyz, 2L, min)
+
+  # 2D XY block grouping (same partitioning as treeOff)
+  block_ij <- floor(
+    (xyz[, 1:2L, drop = FALSE] - rep(pcd_min[1:2L], each = nrow(xyz))) /
+    (min_res[1:2L] * nbmat_sz[1:2L])
+  )
+  block_key    <- paste(block_ij[, 1L], block_ij[, 2L], sep = "_")
+  block_groups <- split(seq_len(nrow(xyz)), block_key)
+
+  pcd_pred <- matrix(0, nrow(xyz), 3L)   # per-point (dx, dy, dz) in voxel units
+
+  nblk <- length(block_groups)
+  .pb  <- if (verbose) {
+    function(i) invisible(NULL)
+  } else {
+    function(i) {
+      filled <- round(30L * i / nblk)
+      cat(sprintf("\r  [%s] %3d%%  (%d/%d blocks)",
+                  paste0(strrep("=", filled), strrep(" ", 30L - filled)),
+                  round(100L * i / nblk), i, nblk),
+          file = stderr())
+      if (i == nblk) cat("\n", file = stderr())
+    }
+  }
+
+  model$eval()
+  for (k in seq_along(block_groups)) {
+    .pb(k)
+    idx       <- block_groups[[k]]
+    pts_block <- xyz[idx, 1:3L, drop = FALSE]
+    sp_min    <- apply(pts_block, 2L, min)
+
+    # Voxelize block → flat 3D indices (X-major order, same as treeOff)
+    ijk <- floor((pts_block - rep(sp_min, each = nrow(pts_block))) /
+                 rep(min_res, each = nrow(pts_block)))
+    valid <- apply(ijk < rep(nbmat_sz, each = nrow(ijk)) & ijk >= 0L, 1L, all)
+    ijk_v <- ijk[valid, , drop = FALSE]
+    idx_v <- idx[valid]
+    if (length(idx_v) == 0L) next
+
+    flat3d <- as.integer(ijk_v[, 1L]) * nbmat_sz[2L] * nbmat_sz[3L] +
+              as.integer(ijk_v[, 2L]) * nbmat_sz[3L] +
+              as.integer(ijk_v[, 3L])
+    unq3d <- unique(flat3d)
+    inv3d <- match(flat3d, unq3d)
+
+    # Channel 1: per-3D-voxel mean of stem_cls for points in this block.
+    # Port of: npg.aggregate(nb_inverse_idx, stem_cls[idx][nb_sel], 'mean')
+    nb_stem_u <- as.numeric(tapply(stem_cls[idx_v], inv3d, mean))
+
+    # Build 2-channel input tensor: (nb_tsz, 2) → (1, 2, Z, Y, X)
+    x_data <- torch_zeros(nb_tsz, 2L)
+    x_data[unq3d + 1L, 1L] <- 1.0              # channel 0: occupancy
+    x_data[unq3d + 1L, 2L] <- nb_stem_u        # channel 1: stem fraction per voxel
+    x_in <- x_data$
+      reshape(c(1L, nbmat_sz[1L], nbmat_sz[2L], nbmat_sz[3L], 2L))$
+      permute(c(1L, 5L, 2L, 3L, 4L))$           # (B, C=2, X, Y, Z)
+      transpose(3L, 5L)$                         # (B, C=2, Z, Y, X)
+      to(device = device)
+
+    # Forward → h: (B=1, out_chans=3, Z, Y, X)
+    with_no_grad({ h <- model(x_in) })
+
+    # Extract 3D offsets at occupied voxels, propagate to per-point predictions.
+    # Port of: torch.swapaxes(h,-1,2) → moveaxis(1,-1) → reshape(nb_tsz,3)
+    #                                                    → [idx] → inverse map
+    h_flat      <- h$transpose(3L, 5L)$            # (B, 3, X, Y, Z)
+                    permute(c(1L, 3L, 4L, 5L, 2L))$# (B, X, Y, Z, 3)
+                    reshape(c(nb_tsz, 3L))          # (nb_tsz, 3)
+    pred_at_pts <- as.matrix(h_flat[unq3d + 1L, ]$cpu())  # (n_unq, 3)
+    pcd_pred[idx_v, ] <- pred_at_pts[inv3d, ]      # broadcast back to all points
+  }
+
+  # Scale voxel-unit offsets to metres
+  pcd_pred[, 1L] <- pcd_pred[, 1L] * min_res[1L]
+  pcd_pred[, 2L] <- pcd_pred[, 2L] * min_res[2L]
+  pcd_pred[, 3L] <- pcd_pred[, 3L] * min_res[3L]
+
+  # Shift full cloud by predicted offsets (stems shift too, but keep their IDs)
+  shifted_xyz <- xyz[, 1:3L, drop = FALSE] + pcd_pred
+
+  # Step 1 — mergeshift: assign each unassigned point to nearest shifted stem
+  init_labels <- .crownoff_mergeshift(shifted_xyz, stem_cls, tree_ids)
+
+  # Step 2 — mergeremain: NN-fill any residual zeros using original coords
+  as.integer(.crownoff_mergeremain(xyz[, 1:3L, drop = FALSE], init_labels,
+                                   dec_res = 0.2))
+}
