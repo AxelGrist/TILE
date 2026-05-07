@@ -1654,6 +1654,8 @@ segment_trees_treeisonet <- function(las, tls_params) {
       message("  [4/4] CrownOff3D: skipped (treeisonet_crownoff_model = NA).")
     }
 
+  }  # end TLS/UAV else branch
+
   elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
   n_trees <- length(unique(tree_ids[tree_ids > 0L]))
   message(sprintf("  Done: %d trees on %d pts (%.1f s).",
