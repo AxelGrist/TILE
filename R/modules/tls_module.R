@@ -650,7 +650,7 @@ plot_cloud_qc <- function(pts,
                   col    = c("#aaff01", "#f02b00", "#7a4101",
                              "#0a9e00", "#9f0aef",
                              "#f54b8c", "#ae5504", "#0000fe"),
-                  pch = 19, bty = "n", cex = 1.1)
+                  pch = 19, bty = "n", cex = 0.7)
   invisible(ds)
 }
 
