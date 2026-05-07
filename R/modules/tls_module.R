@@ -340,7 +340,9 @@ tls_params <- list(
   #
   #   TLS boreal / UAV mixedwood:
   #     StemCls (ESegformer3D) → TreeLoc (Detection) → shortestpath3D (graph)
+  #     → CrownOff3D (Regression) → mergeshift (assigns foliage + branches)
   #     Set treeisonet_stemcls_model + treeisonet_treeloc_model.
+  #     Set treeisonet_crownoff_model for step 4 crown assignment.
   #
   #   ALS reclamation:
   #     TreeLoc (Detection) → TreeOff (Regression) → mergeshift (kNN)
@@ -350,6 +352,7 @@ tls_params <- list(
   # Model names must exist in treeaibox_model_zoo(); auto-downloaded on first use.
   treeisonet_stemcls_model    = "treeisonet_tls_boreal_stemcls_esegformer3D_128_4cm(GPU3GB)",
   treeisonet_treeloc_model    = "treeisonet_tls_boreal_treeloc_esegformer3D_128_10cm(GPU3GB)",
+  treeisonet_crownoff_model   = "treeisonet_tls_boreal_crownoff_esegformer3D_128_15cm(GPU4GB)",
   treeisonet_treeoff_model    = NA_character_,   # set for ALS reclamation path
   treeisonet_device           = "auto",  # "auto" | "cuda" | "cpu"
 
@@ -1621,7 +1624,41 @@ segment_trees_treeisonet <- function(las, tls_params) {
       k_graph           = tls_params$treeisonet_k_graph,
       k_node            = tls_params$treeisonet_k_node,
       verbose           = TRUE)
-  }
+
+    # Step 4: CrownOff3D → assign foliage / branches that shortestpath3D
+    # could not reach (only stems get TreeID from the graph).
+    crownoff_name <- tls_params$treeisonet_crownoff_model
+    if (!is.na(crownoff_name) && nzchar(crownoff_name)) {
+      crown_idx <- which(tree_ids == 0L)   # points not yet assigned
+      if (length(crown_idx) > 0L) {
+        message(sprintf("  [4/4] CrownOff3D: %d unassigned points -> loading model '%s'...",
+                        length(crown_idx), crownoff_name))
+        crownoff_bundle <- treeAIBoxR::load_treeaibox_model(
+          model_name = crownoff_name, device = device)
+        # Run CrownOff on the full point set; model uses treeloc context
+        # to predict per-point XY offset to the nearest tree crown centre.
+        crown_offsets <- treeAIBoxR::treeisonet_run_treeoff(
+          xyz          = pts,
+          treelocs     = base_locs,
+          model_bundle = crownoff_bundle,
+          vox_override = vox_override,
+          verbose      = TRUE)
+        crown_ids <- treeAIBoxR::treeisonet_mergeshift(
+          xyz      = pts,
+          offsets  = crown_offsets,
+          treelocs = base_locs)
+        # Only overwrite points still unassigned after shortestpath3D.
+        tree_ids[crown_idx] <- crown_ids[crown_idx]
+        n_crown_assigned <- sum(tree_ids[crown_idx] > 0L)
+        message(sprintf("  [4/4] CrownOff3D done: %d / %d previously-unassigned points now have a TreeID.",
+                        n_crown_assigned, length(crown_idx)))
+        rm(crownoff_bundle, crown_offsets, crown_ids, crown_idx)
+      } else {
+        message("  [4/4] CrownOff3D: all points already assigned; step skipped.")
+      }
+    } else {
+      message("  [4/4] CrownOff3D: skipped (treeisonet_crownoff_model = NA).")
+    }
 
   elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
   n_trees <- length(unique(tree_ids[tree_ids > 0L]))
