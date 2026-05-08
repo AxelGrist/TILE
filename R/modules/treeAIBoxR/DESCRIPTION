@@ -1,0 +1,32 @@
+Package: treeAIBoxR
+Type: Package
+Title: R-Native Wood/Foliage Classification Using TreeAIBox Weights
+Version: 0.1.0
+Authors@R: person("Andrew", "G.", role = c("aut", "cre"),
+                  email = "andrew@example.invalid")
+Description: Pure-R port of the voxelized 3D SegFormer architecture used
+    in NRCan's TreeAIBox plugin (Xi, Hopkinson & Chasmer 2018; Xi,
+    Chasmer & Hopkinson 2023). Loads the official TreeAIBox PyTorch
+    state dicts via the R 'torch' package and runs inference on per-tree
+    point clouds without requiring Python, CloudCompare, or PyTorch.
+    Distributed for non-commercial research use; pretrained weights are
+    licensed CC BY-NC 4.0 by NRCan.
+License: GPL (>= 2)
+Encoding: UTF-8
+Depends: R (>= 4.2)
+Imports:
+    torch (>= 0.13.0),
+    data.table,
+    R6,
+    jsonlite,
+    igraph,
+    mclust,
+    Rcpp (>= 1.0.0)
+LinkingTo:
+    Rcpp,
+    BH
+Suggests:
+    testthat
+RoxygenNote: 7.3.2
+SystemRequirements: A CPU build of libtorch is sufficient. CUDA is
+    optional and only used if torch::cuda_is_available() returns TRUE.

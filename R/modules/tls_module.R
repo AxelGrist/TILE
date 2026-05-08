@@ -1634,7 +1634,7 @@ segment_trees_treeisonet <- function(las, tls_params) {
     if (!is.na(crownoff_name) && nzchar(crownoff_name)) {
       n_unassigned <- sum(tree_ids == 0L)
       if (n_unassigned > 0L) {
-        message(sprintf("  [4/4] CrownOff3D: %d unassigned points -> loading model '%s'...",
+        message(sprintf("  [4/5] CrownOff3D: %d unassigned points -> loading model '%s'...",
                         n_unassigned, crownoff_name))
         crownoff_bundle <- treeAIBoxR::load_treeaibox_model(
           model_name = crownoff_name, device = device)
@@ -1644,15 +1644,32 @@ segment_trees_treeisonet <- function(las, tls_params) {
           model_bundle = crownoff_bundle,
           vox_override = vox_override,
           verbose      = TRUE)
-        message(sprintf("  [4/4] CrownOff3D done: %d / %d points have a TreeID.",
+        message(sprintf("  [4/5] CrownOff3D done: %d / %d points have a TreeID.",
                         sum(tree_ids > 0L), length(tree_ids)))
         rm(crownoff_bundle)
       } else {
-        message("  [4/4] CrownOff3D: all points already assigned; step skipped.")
+        message("  [4/5] CrownOff3D: all points already assigned; step skipped.")
       }
     } else {
-      message("  [4/4] CrownOff3D: skipped (treeisonet_crownoff_model = NA).")
+      message("  [4/5] CrownOff3D: skipped (treeisonet_crownoff_model = NA).")
     }
+
+    # Step 5: CrownClustersSP → cut-pursuit over-segmentation + Dijkstra
+    # Mirrors crownCluster.shortestpath3D() + init_cutpursuit() from TreeAIBox.
+    # Assigns remaining zero-labelled crown points by blob-graph routing.
+    message("  [5/5] CrownClustersSP: cut-pursuit blob segmentation + Dijkstra...")
+    tree_ids <- treeAIBoxR::treeisonet_run_crownclustersp(
+      xyz               = pts,
+      tree_ids_crownoff = tree_ids,
+      min_res_cp        = tls_params$treeisonet_min_res_cp %||% 0.15,
+      K_cp              = tls_params$treeisonet_K_cp       %||% 5L,
+      reg_strength      = tls_params$treeisonet_reg_strength %||% 1.0,
+      min_res_sp        = tls_params$treeisonet_min_res     %||% 0.06,
+      max_isolated_dist = tls_params$treeisonet_max_isolated_dist %||% 0.3,
+      k_node            = tls_params$treeisonet_k_node     %||% 20L,
+      verbose           = TRUE)
+    message(sprintf("  [5/5] CrownClustersSP done: %d / %d points have a TreeID.",
+                    sum(tree_ids > 0L), length(tree_ids)))
 
   }  # end TLS/UAV else branch
 

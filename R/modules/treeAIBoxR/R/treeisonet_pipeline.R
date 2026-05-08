@@ -383,9 +383,11 @@ treeisonet_run_treeloc <- function(xyz,
 #' @param base_locs       matrix (b, 3) of tree-base XYZ from
 #'   \code{treeisonet_run_treeloc()}.
 #' @param min_res         voxel edge length for decimation (m).
-#' @param max_isolated_dist  maximum 3D edge length in kNN graph (m).
+#' @param max_isolated_dist  maximum 2-D XY edge length filter for the node
+#'   graph (m).  Mirrors \code{max_distance} in \code{stemCluster.py}.
 #' @param k_graph         kNN k for point-level graph edges.
-#' @param k_node          kNN k for component-centroid node graph.
+#' @param k_node          kNN k for component-centroid node graph (passed to
+#'   \code{create_node_graph_rcpp()}).
 #' @param verbose         print progress.
 #' @return integer vector length n: tree ID (1-indexed) for each point;
 #'   0 = unassigned (isolated / no path to any base).
@@ -403,6 +405,9 @@ treeisonet_shortestpath3D <- function(xyz,
          "Install with: install.packages('igraph')")
   if (!requireNamespace("RANN", quietly = TRUE))
     stop("treeisonet_shortestpath3D() requires RANN.")
+  if (!requireNamespace("mclust", quietly = TRUE))
+    stop("treeisonet_shortestpath3D() requires mclust. ",
+         "Install with: install.packages('mclust')")
 
   out <- rep(0L, nrow(xyz))
 
@@ -471,7 +476,11 @@ treeisonet_shortestpath3D <- function(xyz,
   base_node_ids <- as.integer(nn_b2d$nn.idx[, 1L])  # dec-node index per base
   n_bases       <- nrow(base_locs)
 
-  # 6. K-means split for components with >1 base --------------------------
+  # 6. BGM split for components with >1 base ------------------------------
+  # Mirrors BayesianGaussianMixture(n_components=k, init_params='k-means++')
+  # in stemCluster.py: mclust::Mclust with G=1:nb can collapse to fewer than nb
+  # components when the data doesn't support the requested number — the same
+  # collapsing behaviour as Python's BGM.
   base_comp     <- comp_labels[base_node_ids]  # component of each base
   comp_n_bases  <- tapply(seq_len(n_bases), base_comp, length)
   multi_comps   <- as.integer(names(comp_n_bases)[comp_n_bases > 1L])
@@ -483,14 +492,16 @@ treeisonet_shortestpath3D <- function(xyz,
       bases_in_c   <- which(base_comp == cid)
       nb           <- length(bases_in_c)
       if (nb <= 1L || length(comp_pts_idx) < nb) next
-      km <- tryCatch(
-        stats::kmeans(xyz_dec[comp_pts_idx, , drop = FALSE],
-                      centers = nb, iter.max = 100L, nstart = 3L),
+      # mclust: BIC selects the best G in 1:nb — if G=1 wins, no split happens
+      mc <- tryCatch(
+        mclust::Mclust(xyz_dec[comp_pts_idx, , drop = FALSE],
+                       G = seq_len(nb), verbose = FALSE),
         error = function(e) NULL)
-      if (is.null(km)) next
-      for (kk in seq_len(nb)) {
-        if (kk == 1L) next     # keep cid for first cluster
-        sub_idx <- comp_pts_idx[km$cluster == kk]
+      if (is.null(mc) || mc$G <= 1L) next
+      # mc$classification is 1-indexed cluster per point in comp_pts_idx
+      for (kk in seq_len(mc$G)) {
+        if (kk == 1L) next    # keep original cid for first cluster
+        sub_idx <- comp_pts_idx[mc$classification == kk]
         max_lbl <- max_lbl + 1L
         comp_labels[sub_idx] <- max_lbl
       }
@@ -499,23 +510,27 @@ treeisonet_shortestpath3D <- function(xyz,
     base_comp <- comp_labels[base_node_ids]
   }
 
-  # 7. Build node graph (component centroids) -----------------------------
+  # 7. Build node graph with TRUE min-point distances ----------------------
+  # Mirrors stemCluster.create_node_graph(): k=k_node nearest component
+  # centroids, then min 3D point-to-point distance between actual point sets.
+  # Edge filter: 2D XY centroid distance < max_isolated_dist (primary, 2D only).
   unique_comps <- sort(unique(comp_labels))
   n_comps      <- length(unique_comps)
   comp_map     <- setNames(seq_len(n_comps), as.character(unique_comps))
 
-  centroids <- do.call(rbind, lapply(unique_comps, function(cid) {
-    colMeans(xyz_dec[comp_labels == cid, , drop = FALSE])
-  }))
+  # Remap comp_labels to 0-based for create_node_graph_rcpp
+  labels_0based <- comp_map[as.character(comp_labels)] - 1L
 
   if (n_comps > 1L) {
-    k_n <- min(k_node, n_comps - 1L)
-    nn_c <- RANN::nn2(centroids, centroids, k = k_n + 1L)
-    ne_from <- rep(seq_len(n_comps), each = k_n)
-    ne_to   <- as.vector(t(nn_c$nn.idx[, -1L, drop = FALSE]))
-    ne_w    <- as.vector(t(nn_c$nn.dists[, -1L, drop = FALSE]))
-    valid_e <- ne_w < max_isolated_dist * 2L & ne_from != ne_to
-    ne_from <- ne_from[valid_e]; ne_to <- ne_to[valid_e]; ne_w <- ne_w[valid_e]
+    ng <- create_node_graph_rcpp(
+      xyz       = xyz_dec[, 1:3L, drop = FALSE],
+      labels    = labels_0based,
+      k         = as.integer(k_node),
+      max_dist_2d = max_isolated_dist
+    )
+    ne_from <- ng$from
+    ne_to   <- ng$to
+    ne_w    <- ng$dist3d   # Dijkstra weight = min 3D point-to-point distance
   } else {
     ne_from <- integer(0L); ne_to <- integer(0L); ne_w <- numeric(0L)
   }
@@ -958,4 +973,216 @@ treeisonet_run_crownoff <- function(xyz, tree_ids, model_bundle,
   # Step 2 — mergeremain: NN-fill any residual zeros using original coords
   as.integer(.crownoff_mergeremain(xyz[, 1:3L, drop = FALSE], init_labels,
                                    dec_res = 0.2))
+}
+
+# --------------------------------------------------------------------------
+# treeisonet_run_crownclustersp
+# --------------------------------------------------------------------------
+
+#' Crown-cluster shortest-path assignment (CrownClustersSP)
+#'
+#' R port of \code{crownCluster.shortestpath3D()} + \code{init_cutpursuit()}
+#' from TreeAIBox.  This step:
+#' \enumerate{
+#'   \item Voxel-decimates the full point cloud at \code{min_res_cp} (0.15 m).
+#'   \item Builds a K-nearest-neighbour edge list (K = 5).
+#'   \item Runs L0 cut-pursuit (\code{cut_pursuit_l0_rcpp()}) to produce
+#'         piecewise-constant \emph{blob} labels.
+#'   \item Propagates blob labels back to the full cloud.
+#'   \item For each blob, computes the mode of the positive tree IDs
+#'         from \code{tree_ids_crownoff} — blobs with a positive mode become
+#'         graph seeds.
+#'   \item Builds a component node graph with true minimum point-to-point
+#'         distances (\code{create_node_graph_rcpp()}, 2-D XY filter).
+#'   \item Runs Dijkstra from seeded blobs to assign all remaining blobs.
+#'   \item Propagates the blob assignments back to all points, preserving
+#'         any point that already had a positive tree ID from CrownOff.
+#' }
+#'
+#' @param xyz              numeric matrix (n, 3).  Full point cloud XYZ.
+#' @param tree_ids_crownoff integer vector length n.  Per-point tree IDs from
+#'   \code{treeisonet_run_crownoff()}.  0 = unassigned.
+#' @param min_res_cp       voxel edge length for cut-pursuit decimation (m).
+#'   TreeAIBox default: 0.15.
+#' @param K_cp             number of KNN edges per point for cut-pursuit graph.
+#'   TreeAIBox default: 5.
+#' @param reg_strength     L0 cut-pursuit regularisation strength (lambda).
+#'   TreeAIBox default: 1.0.
+#' @param min_res_sp       voxel edge length for the Dijkstra node-graph
+#'   decimation (m).  TreeAIBox default: 0.06.
+#' @param max_isolated_dist  2-D XY edge filter for the node graph (m).
+#'   TreeAIBox default: 0.3.
+#' @param k_node           k for \code{create_node_graph_rcpp()}.  Default 20.
+#' @param verbose          print progress messages.
+#' @return integer vector length n: updated per-point tree IDs.  Points that
+#'   already had a positive tree ID from CrownOff retain that ID.
+#' @export
+treeisonet_run_crownclustersp <- function(
+    xyz,
+    tree_ids_crownoff,
+    min_res_cp        = 0.15,
+    K_cp              = 5L,
+    reg_strength      = 1.0,
+    min_res_sp        = 0.06,
+    max_isolated_dist = 0.3,
+    k_node            = 20L,
+    verbose           = FALSE
+) {
+  if (!requireNamespace("igraph", quietly = TRUE))
+    stop("treeisonet_run_crownclustersp() requires igraph.")
+
+  n_pts <- nrow(xyz)
+  tree_ids <- as.integer(tree_ids_crownoff)
+
+  # ------------------------------------------------------------------
+  # Step 1: Voxel-decimate at min_res_cp (0.15 m) — cut-pursuit decimation
+  # ------------------------------------------------------------------
+  ijk_key_cp <- paste(floor(xyz[, 1L] / min_res_cp),
+                      floor(xyz[, 2L] / min_res_cp),
+                      floor(xyz[, 3L] / min_res_cp), sep = "_")
+  dec_u_mask_cp  <- !duplicated(ijk_key_cp)
+  dec_uidx_cp    <- which(dec_u_mask_cp)
+  dec_inv_cp     <- match(ijk_key_cp, ijk_key_cp[dec_u_mask_cp])
+  xyz_dec_cp     <- xyz[dec_uidx_cp, 1:3L, drop = FALSE]
+  n_dec_cp       <- nrow(xyz_dec_cp)
+  if (verbose) message(sprintf("CrownClustersSP: %d pts → %d decimated (%.2fm)",
+                               n_pts, n_dec_cp, min_res_cp))
+
+  if (n_dec_cp <= 1L) {
+    # Trivial — no cut-pursuit possible; return unchanged
+    warning("treeisonet_run_crownclustersp: too few points after decimation.")
+    return(tree_ids)
+  }
+
+  # ------------------------------------------------------------------
+  # Step 2: Build KNN graph for cut-pursuit (K=5, undirected pairs)
+  # eu = repeat(0..(n-1), K), ev = nn[:, 1:K+1].ravel()  [0-based]
+  # ------------------------------------------------------------------
+  K_eff <- min(as.integer(K_cp), n_dec_cp - 1L)
+  nn_cp  <- RANN::nn2(xyz_dec_cp, xyz_dec_cp, k = K_eff + 1L)
+  nn_idx_cp <- nn_cp$nn.idx[, -1L, drop = FALSE]   # n_dec x K_eff, 1-based
+
+  eu_cp <- rep(seq_len(n_dec_cp), each = K_eff) - 1L   # 0-based
+  ev_cp <- as.vector(t(nn_idx_cp)) - 1L                  # 0-based
+
+  n_edges_cp <- length(eu_cp)
+  ew_cp      <- rep(1.0, n_edges_cp)   # uniform = reg_strength (normalised inside)
+  nw_cp      <- rep(1.0, n_dec_cp)
+
+  # ------------------------------------------------------------------
+  # Step 3: L0 cut-pursuit → blob labels per decimated point
+  # ------------------------------------------------------------------
+  blob_labels_dec <- cut_pursuit_l0_rcpp(
+    obs          = xyz_dec_cp,
+    Eu           = as.integer(eu_cp),
+    Ev           = as.integer(ev_cp),
+    edge_weights = ew_cp,
+    node_weights = nw_cp,
+    lambda       = as.double(reg_strength),
+    cutoff       = 0L,
+    mode         = 1.0,   # L2 fidelity
+    speed        = 1.0,   # standard
+    weight_decay = 0.0,
+    verbose      = 0.0
+  )   # 0-based blob label per decimated point
+
+  # ------------------------------------------------------------------
+  # Step 4: Propagate blob labels to full cloud
+  # ------------------------------------------------------------------
+  blob_labels_full <- blob_labels_dec[dec_inv_cp]   # 0-based, length n_pts
+
+  n_blobs <- max(blob_labels_dec) + 1L
+  if (verbose) message(sprintf("CrownClustersSP: %d blobs from cut-pursuit", n_blobs))
+
+  # ------------------------------------------------------------------
+  # Step 5: Per-blob mode of positive tree_ids from CrownOff → seeds
+  # filter_g: mode of positive values; 0 if none
+  # ------------------------------------------------------------------
+  .mode_positive <- function(x) {
+    pos <- x[x > 0L]
+    if (length(pos) == 0L) return(0L)
+    tab <- tabulate(pos)
+    which.max(tab)
+  }
+
+  blob_treeoff <- vapply(
+    seq_len(n_blobs) - 1L,          # 0-based blob ids
+    function(bid) {
+      pts_in_blob <- which(blob_labels_full == bid)
+      .mode_positive(tree_ids[pts_in_blob])
+    },
+    integer(1L)
+  )   # length n_blobs; 0 = unseeded
+
+  seeded_blobs <- which(blob_treeoff > 0L)   # 1-based index into blob_treeoff
+  if (length(seeded_blobs) == 0L) {
+    warning("treeisonet_run_crownclustersp: no seeded blobs; returning CrownOff IDs.")
+    return(tree_ids)
+  }
+
+  # ------------------------------------------------------------------
+  # Step 6: Build blob node graph using decimated points from Step 1
+  # Uses create_node_graph_rcpp with 2D XY filter only (matches crownCluster.py)
+  # ------------------------------------------------------------------
+  ng <- create_node_graph_rcpp(
+    xyz         = xyz_dec_cp,
+    labels      = blob_labels_dec,   # 0-based blob per decimated pt
+    k           = as.integer(k_node),
+    max_dist_2d = max_isolated_dist
+  )
+
+  n_comps_ng <- ng$n_comps   # = n_blobs
+
+  if (length(ng$from) == 0L) {
+    # No inter-blob edges: map each point to the seed with closest blob centroid
+    # (fallback: nearest seeded blob by 2D centroid)
+    blob_centroids <- do.call(rbind, lapply(seq_len(n_blobs) - 1L, function(bid) {
+      pts_in_blob <- which(blob_labels_dec == bid)
+      colMeans(xyz_dec_cp[pts_in_blob, , drop = FALSE])
+    }))
+    seed_centroids <- blob_centroids[seeded_blobs, , drop = FALSE]
+    nn_seed <- RANN::nn2(seed_centroids[, 1:2L, drop = FALSE],
+                         blob_centroids[, 1:2L, drop = FALSE], k = 1L)
+    blob_final_treeoff <- blob_treeoff[seeded_blobs[nn_seed$nn.idx[, 1L]]]
+    tree_ids_new <- blob_final_treeoff[blob_labels_full + 1L]
+    keep_mask    <- tree_ids > 0L
+    tree_ids_new[keep_mask] <- tree_ids[keep_mask]
+    return(as.integer(tree_ids_new))
+  }
+
+  # ------------------------------------------------------------------
+  # Step 7: Dijkstra from seeded blobs → assign all blobs
+  # blob node IDs in igraph are 1-based; seeded_blobs already 1-based
+  # ------------------------------------------------------------------
+  g_blob <- igraph::graph_from_data_frame(
+    data.frame(from = ng$from, to = ng$to, weight = ng$dist3d),
+    directed = FALSE,
+    vertices = data.frame(name = seq_len(n_comps_ng))
+  )
+
+  dist_mat <- igraph::distances(
+    g_blob,
+    v       = igraph::V(g_blob)[seeded_blobs],
+    to      = igraph::V(g_blob),
+    weights = igraph::E(g_blob)$weight
+  )   # (n_seeded x n_blobs)
+
+  dist_mat <- t(dist_mat)   # (n_blobs x n_seeded)
+
+  # Assign each blob to nearest seeded blob
+  best_col  <- apply(dist_mat, 1L, which.min)
+  min_dists <- dist_mat[cbind(seq_len(n_blobs), best_col)]
+
+  # blob_final_treeoff[b] = tree ID from the nearest seed (or 0 if unreachable)
+  blob_final_treeoff <- blob_treeoff[seeded_blobs[best_col]]
+  blob_final_treeoff[is.infinite(min_dists)] <- 0L
+
+  # ------------------------------------------------------------------
+  # Step 8: Propagate back to full cloud; preserve existing CrownOff IDs
+  # ------------------------------------------------------------------
+  tree_ids_new <- blob_final_treeoff[blob_labels_full + 1L]
+  keep_mask    <- tree_ids > 0L
+  tree_ids_new[keep_mask] <- tree_ids[keep_mask]
+
+  as.integer(tree_ids_new)
 }
