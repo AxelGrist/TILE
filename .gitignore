@@ -24,3 +24,6 @@ Thumbs.db
 
 # Quarto
 .quarto/
+
+# treeAIBoxR — has its own repo (AxelGrist/TreeAIBoxR)
+R/modules/treeAIBoxR/
