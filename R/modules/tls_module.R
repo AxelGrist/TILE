@@ -94,11 +94,10 @@ las <- normalize_height(las, tin())
 # 2.5 Height Filter
 las <- filter_poi(las, Z <= 50)   # m; hard ceiling after normalization
 
-# 2.6 Point decimation
-# Homogenize to one point per voxel cell at the scanner's effective precision.
-# RS10 SLAM inter-frame error is ~2 cm; no sub-2cm geometry is recoverable.
+# 2.6 Point decimation (3D) — one random point per 2 cm voxel.
+# RS10 SLAM inter-frame error ~2 cm; no sub-2cm geometry is recoverable.
 npts1 <- npoints(las)
-las <- decimate_points(las, homogenize(density = 1, res = 0.02))
+las <- decimate_points(las, random_per_voxel(res = 0.02))
 message(sprintf("Decimate: %d -> %d points (%.1f%% retained).",
                 npts1, npoints(las), 100 * npoints(las) / npts1))
 
