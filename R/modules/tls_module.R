@@ -3,7 +3,8 @@
 # ============================================================================
 # Pipeline:
 #   1. Read + inspect cloud (lidR readLAS / las_check).
-#   2. Pre-process at full density: dedupe, ground (CSF), normalize, SOR.
+#   2. Pre-process: dedupe, SOR, PTD ground classification, normalize,
+#      height filter, then decimate to scanner precision (res = 0.02 m, RS10).
 #   3. Segmentation: TreeFilter -> overstory mask; TreeisoNet (StemCls ->
 #      TreeLoc -> shortestpath3D) -> TreeID per overstory point.
 #      3.1 Eigen geometry (fine + optional coarse / multi-scale).
@@ -73,22 +74,8 @@ las_check(las)
 # 2.1 Point Deduplication
 las <- filter_duplicates(las)
 
-# 2.2 Ground classification (CSF)
-las <- classify_ground(las, csf(
-  sloop_smooth     = TRUE,
-  class_threshold  = 0.05,
-  cloth_resolution = 0.4,
-  rigidness        = 3L,
-  time_step        = 0.65
-))
-
-# 2.3 Height Normalization
-las <- normalize_height(las, tin())
-
-# 2.4 Height Filter
-las <- filter_poi(las, Z <= 50)   # m; hard ceiling after normalization
-
-# 2.5 Statistical outlier removal
+# 2.2 Statistical outlier removal
+# Run before ground classification so PTD receives a clean cloud.
 npts0 <- npoints(las)
 las <- classify_noise(las, sor(k = 8, m = 3))
 las <- filter_poi(las, Classification != LASNOISE)
@@ -96,8 +83,26 @@ message(sprintf("SOR: removed %d / %d points (%.2f%%) as noise.",
                 npts0 - npoints(las), npts0,
                 100 * (npts0 - npoints(las)) / npts0))
 
+# 2.3 Ground classification (PTD)
+# res = 5 m for small TLS plot (~22 m across); lidR recommends PTD exclusively
+# as of early 2026. PTD includes internal low-outlier handling.
+las <- classify_ground(las, ptd(res = 5))
+
+# 2.4 Height Normalization
+las <- normalize_height(las, tin())
+
+# 2.5 Height Filter
+las <- filter_poi(las, Z <= 50)   # m; hard ceiling after normalization
+
+# 2.6 Point decimation
+# Homogenize to one point per voxel cell at the scanner's effective precision.
+# RS10 SLAM inter-frame error is ~2 cm; no sub-2cm geometry is recoverable.
+npts1 <- npoints(las)
+las <- decimate_points(las, homogenize(density = 1, res = 0.02))
+message(sprintf("Decimate: %d -> %d points (%.1f%% retained).",
+                npts1, npoints(las), 100 * npoints(las) / npts1))
+
 writeLAS(las, file.path(out_dir, "checkpoint_01_preproc.laz"))
-# QC: plot(las, color = "Classification")
 
 # 3. SEGMENT ----
 
