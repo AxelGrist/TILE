@@ -3,7 +3,7 @@
 # ============================================================================
 # Pipeline:
 #   1. Read + inspect cloud (lidR readLAS / las_check).
-#   2. Pre-process: dedupe, SOR, PTD ground classification, normalize,
+#   2. Pre-process: dedupe, SOR, CSF ground classification, normalize,
 #      height filter, then decimate to scanner precision (res = 0.02 m, RS10).
 #   3. Segmentation: TreeFilter -> overstory mask; TreeisoNet (StemCls ->
 #      TreeLoc -> shortestpath3D) -> TreeID per overstory point.
@@ -83,10 +83,16 @@ message(sprintf("SOR: removed %d / %d points (%.2f%%) as noise.",
                 npts0 - npoints(las), npts0,
                 100 * (npts0 - npoints(las)) / npts0))
 
-# 2.3 Ground classification (PTD)
-# res = 5 m for small TLS plot (~22 m across); lidR recommends PTD exclusively
-# as of early 2026. PTD includes internal low-outlier handling.
-las <- classify_ground(las, ptd(res = 5))
+# 2.3 Ground classification (CSF)
+# PTD (lidR's current recommendation) misclassifies low peripheral stem bases
+# as ground seeds in small TLS plots. CSF cloth simulation is more robust here.
+las <- classify_ground(las, csf(
+  sloop_smooth     = TRUE,
+  class_threshold  = 0.05,
+  cloth_resolution = 0.4,
+  rigidness        = 3L,
+  time_step        = 0.65
+))
 
 # 2.4 Height Normalization
 las <- normalize_height(las, tin())
