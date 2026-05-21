@@ -27,12 +27,12 @@
 library(lidR)
 library(sf)
 library(treeAIBoxR)
+
 # Xeon w5-2545: 12 physical / 24 logical cores, 128 GB RAM. No competition
 # for cycles on this box, so use all logical threads.
 n_threads <- parallel::detectCores(logical = TRUE)   # 24
 lidR::set_lidr_threads(n_threads)
-if (requireNamespace("data.table", quietly = TRUE))
-  data.table::setDTthreads(n_threads)
+data.table::setDTthreads(n_threads)
 # BLAS/LAPACK and Rcpp+OpenMP thread cap is set in TILE/.Renviron via
 # OMP_NUM_THREADS (also governs OPENBLAS/MKL) and applied at R startup.
 # Restart R after changing it.
@@ -61,13 +61,21 @@ tree_qc_subdir <- "tree_qc"
 min_tree_height_m <- 6.0    # m; drop trees with Z range < this
 min_tree_points   <- 200L   # pts; drop trees with fewer total points
 
+# UAV point cloud for fusion (Section 3.6). Set to NULL to skip.
+# Must be in a projected CRS (UTM); used as the alignment reference.
+uav_input <- "C:/Users/AGRIST/OneDrive - Government of BC/Sklar, Daniel FOR_EX's files - Great Beaver Lake/Plot 311/GBL_ALS.las"   # e.g. "G:/alpine_treemapping/TILE/inputs/uav_gbl.las"
+uav_stem_match_radius <- 1.5   # m: UAV stemcls uncertainty + registration residual
+
+# UTM coordinates of plot centre (= SLAM scanner start position).
+# SLAM cloud has no CRS; these are added as a coarse pre-translation before ICP.
+# Fill in from GPS field notes or first point of the GNSS trajectory.
+plot_utm_easting  <- NA_real_   # TODO: UTM easting  (m)
+plot_utm_northing <- NA_real_   # TODO: UTM northing (m)
+plot_utm_crs      <- NA_integer_  # TODO: EPSG code, e.g. 32610 for UTM Zone 10N
 
 
 # 1.0 READ----
-
-
-las_raw <- readLAS(tls_input, select = "xyzicrnRGB")
-if (is.empty(las_raw)) stop("Input LAS is empty / failed to read.")
+las_raw <- readLAS(tls_input, select = "xyzicrnRGB") # Only read select headers to save RAM processing
 las_check(las_raw)
 
 # 2.0 PRE-PROCESSING----
@@ -102,6 +110,8 @@ las_filtered <- treeAIBoxR::treefiltering(
   verbose = TRUE
 )
 # QC: plot_cloud_qc(las_filtered, color_by = "TreeFilterLabel")
+# Register treefiltering output column as LAS extra byte so writeLAS() persists it.
+las_filtered <- lidR::add_lasattribute(las_filtered, las_filtered@data[["TreeFilterLabel"]], "TreeFilterLabel", "Tree filter label")
 writeLAS(las_filtered, file.path(out_dir, "checkpoint_02a_treefilter.laz"))
 
 
@@ -109,24 +119,25 @@ writeLAS(las_filtered, file.path(out_dir, "checkpoint_02a_treefilter.laz"))
 #     Adds TreeID, StemCls, TreeLocX, TreeLocY. Runs on overstory points only.
 las_segmented <- treeAIBoxR::treeisonet(
   las_filtered,
-  stemcls_model     = "treeisonet_tls_boreal_stemcls_esegformer3D_128_4cm(GPU3GB)",
-  treeloc_model     = "treeisonet_tls_boreal_treeloc_esegformer3D_128_10cm(GPU3GB)",
-  crownoff_model    = "treeisonet_tls_boreal_crownoff_esegformer3D_128_15cm(GPU4GB)",
-  conf_thresh       = 0.1,   # default 0.3 - minimum; catch even faint stem responses
-  nms_thresh_xy     = 0.15,  # default 0.5 m - 0.05 caused phantom double-detection splits; 0.15 = 1x stem diameter
-  max_isolated_dist = 0.12,  # default 0.3 m - 3x voxel size; bridges stem/crown gaps without jumping trees
-  k_graph           = 5L,    # default 10   - vertical redundancy without reopening cross-crown wiring
-  cuda              = TRUE,
-  verbose           = TRUE
+  stemcls_model        = "treeisonet_tls_boreal_stemcls_esegformer3D_128_4cm(GPU3GB)",
+  treeloc_model        = "treeisonet_tls_boreal_treeloc_esegformer3D_128_10cm(GPU3GB)",
+  crownoff_model       = "treeisonet_tls_boreal_crownoff_esegformer3D_128_15cm(GPU4GB)",
+  conf_thresh          = 0.15,  # Python hardcodes 0.1; raised to 0.15 to suppress sapling phantoms (trees 109,162,198,221,406,526)
+  max_isolated_dist    = 0.12,  # default 0.3 m - 3x voxel size; bridges stem/crown gaps without jumping trees
+  k_graph              = 10L,   # Python stemCluster.shortestpath3D uses k=min(len,10) hardcoded
+  k_node               = 10L,   # Python stemCluster.create_node_graph() uses k=10 hardcoded; R default was 20
+  stemcls_min_points   = 200L,  # Python default 100; raised to 200 as second gate against sapling stem clusters
+  cuda                 = TRUE,
+  verbose              = TRUE
 )
 
 # 3.3 Trim: drop trees whose TreeLoc base falls outside plot_radius + plot_buffer.
 #     After trim, las contains only points assigned to plot trees.
-r_max    <- plot_radius + plot_buffer
-plot_ids <- las_segmented@data[TreeID > 0L & !is.na(TreeLocX),
-                     .(lx = TreeLocX[[1L]], ly = TreeLocY[[1L]]), by = TreeID
-                    ][sqrt((lx - plot_center_x)^2 + (ly - plot_center_y)^2) <= r_max,
-                      TreeID]
+r_max     <- plot_radius + plot_buffer
+tree_locs <- las_segmented@data[TreeID > 0L & !is.na(TreeLocX),
+                                .(lx = TreeLocX[1L], ly = TreeLocY[1L]),
+                                by = TreeID]
+plot_ids  <- tree_locs[sqrt((lx - plot_center_x)^2 + (ly - plot_center_y)^2) <= r_max, TreeID]
 las_segmented <- filter_poi(las_segmented, TreeID %in% plot_ids)
 message(sprintf("[3] Plot filter: %d trees within %.2f m of center.", length(plot_ids), r_max))
 
@@ -146,6 +157,12 @@ las_segmented <- filter_poi(las_segmented, TreeID %in% pt_ids)
 message(sprintf("[3] Point filter: %d trees >= %d pts (dropped %d).",
                 length(pt_ids), min_tree_points,
                 length(hgt_ids) - length(pt_ids)))
+
+# Register treeisonet output columns as LAS extra bytes so writeLAS() persists them.
+las_segmented <- lidR::add_lasattribute(las_segmented, las_segmented@data[["TreeID"]],   "TreeID",   "Tree ID")
+las_segmented <- lidR::add_lasattribute(las_segmented, las_segmented@data[["StemCls"]],  "StemCls",  "Stem class")
+las_segmented <- lidR::add_lasattribute(las_segmented, las_segmented@data[["TreeLocX"]], "TreeLocX", "Tree base X (m)")
+las_segmented <- lidR::add_lasattribute(las_segmented, las_segmented@data[["TreeLocY"]], "TreeLocY", "Tree base Y (m)")
 
 writeLAS(las_segmented, file.path(out_dir, "checkpoint_02b_segmented.laz"))
 
@@ -214,21 +231,172 @@ if (TRUE) {   # set FALSE to skip
   message("[seg_qc] Done: ", seg_qc_dir)
 }
 
+# Run these lines (+ config) if needed to recover las checkpoint after a crash
+#las_segmented <- lidR::readLAS(file.path(out_dir, "checkpoint_02b_segmented.laz"))
+#data.table::setDT(las_segmented@data)
+
+
+# ============================================================================
+# 3.6  UAV FUSION
+# Register TLS into UAV CRS, run UAV treeisonet, match stems, fuse clouds.
+# If no UAV data: run the TLS-only fallback line below and skip to Section 4.
+# ============================================================================
+
+# TLS-only fallback — run this and skip to Section 4 if uav_input is not used.
+las_fused <- las_segmented
+data.table::setDT(las_fused@data)
+las_fused@data[, Source := 1L]
+
+# 3.6a  Register TLS into UAV CRS  (UAV = reference, TLS = moving)
+utm_crs <- sf::st_crs(lidR::readLASheader(uav_input))
+
+# Pre-translate SLAM cloud from scanner-local frame to UTM.
+# SLAM origin (0,0) = scanner start = plot centre, so offset = plot GPS coordinates.
+las_pretrans <- lidR::readLAS(file.path(out_dir, "checkpoint_02b_segmented.laz"))
+data.table::setDT(las_pretrans@data)
+las_pretrans@data[, X := X + plot_utm_easting]
+las_pretrans@data[, Y := Y + plot_utm_northing]
+lidR::projection(las_pretrans) <- sf::st_crs(plot_utm_crs)
+lidR::writeLAS(las_pretrans, file.path(out_dir, "tls_pretranslated.laz"))
+rm(las_pretrans)
+# QC: lidR::plot(lidR::readLAS(file.path(out_dir, "tls_pretranslated.laz")), color = "Z", bg = "white")
+
+al <- lidRalignment::AlignmentScene$new(
+        uav_input,
+        file.path(out_dir, "tls_pretranslated.laz"))
+al$set_ref_is_ground_based(FALSE)   # UAV = airborne
+al$set_mov_is_ground_based(TRUE)    # TLS = ground-based
+al$set_radius(plot_radius + plot_buffer)
+al$align()
+
+M            <- al$get_registration_matrix()
+tmp_reg      <- lidRalignment::transform_las(
+                  file.path(out_dir, "checkpoint_02b_segmented.laz"), M, utm_crs)
+tls_reg_path <- file.path(out_dir, "checkpoint_02c_tls_registered.laz")
+file.rename(tmp_reg, tls_reg_path)
+
+# Patch extra bytes: transform_las strips all non-standard fields.
+las_reg_stripped <- lidR::readLAS(tls_reg_path)
+las_seg_orig     <- lidR::readLAS(file.path(out_dir, "checkpoint_02b_segmented.laz"))
+las_reg_stripped <- lidR::add_lasattribute(las_reg_stripped, las_seg_orig@data[["TreeID"]],   "TreeID",   "Tree ID")
+las_reg_stripped <- lidR::add_lasattribute(las_reg_stripped, las_seg_orig@data[["StemCls"]],  "StemCls",  "Stem class")
+las_reg_stripped <- lidR::add_lasattribute(las_reg_stripped, las_seg_orig@data[["TreeLocX"]], "TreeLocX", "Tree base X (m)")
+las_reg_stripped <- lidR::add_lasattribute(las_reg_stripped, las_seg_orig@data[["TreeLocY"]], "TreeLocY", "Tree base Y (m)")
+lidR::writeLAS(las_reg_stripped, tls_reg_path)
+rm(las_reg_stripped, las_seg_orig)
+
+las_tls_reg <- lidR::readLAS(tls_reg_path)
+data.table::setDT(las_tls_reg@data)
+las_tls_reg@data[, Source := 1L]
+# QC: lidR::plot(las_tls_reg, color = "Z", bg = "white")
+
+tls_ctr_x  <- (las_tls_reg@header$`Min X` + las_tls_reg@header$`Max X`) / 2
+tls_ctr_y  <- (las_tls_reg@header$`Min Y` + las_tls_reg@header$`Max Y`) / 2
+uav_clip_r <- plot_radius + plot_buffer + 5   # 5 m margin beyond plot edge
+
+# 3.6b  UAV treeisonet  (clipped to plot extent before segmentation)
+las_uav_raw <- lidR::readLAS(uav_input,
+                             filter = paste("-keep_circle", tls_ctr_x, tls_ctr_y, uav_clip_r))
+message(sprintf("[3.6b] UAV clip: %d pts.", npoints(las_uav_raw)))
+# QC: lidR::plot(las_uav_raw, color = "Z", bg = "white")
+
+las_uav_seg <- treeAIBoxR::treeisonet(
+  las_uav_raw,
+  sensor         = "uav",
+  stemcls_model  = "treeisonet_uav_mixedwood_stemcls_esegformer3D_128_8cm(GPU3GB)",
+  treeloc_model  = "treeisonet_uav_mixedwood_treeloc_esegformer3D_128_10cm(GPU3GB)",
+  crownoff_model = "treeisonet_uav_mixedwood_crownoff_esegformer3D_128_15cm(GPU4GB)",
+  cuda           = TRUE,
+  verbose        = TRUE
+)
+las_uav_seg <- lidR::add_lasattribute(las_uav_seg, las_uav_seg@data[["TreeID"]],   "TreeID",   "Tree ID")
+las_uav_seg <- lidR::add_lasattribute(las_uav_seg, las_uav_seg@data[["StemCls"]],  "StemCls",  "Stem class")
+las_uav_seg <- lidR::add_lasattribute(las_uav_seg, las_uav_seg@data[["TreeLocX"]], "TreeLocX", "Tree base X (m)")
+las_uav_seg <- lidR::add_lasattribute(las_uav_seg, las_uav_seg@data[["TreeLocY"]], "TreeLocY", "Tree base Y (m)")
+lidR::writeLAS(las_uav_seg, file.path(out_dir, "checkpoint_uav_segmented.laz"))
+data.table::setDT(las_uav_seg@data)
+las_uav_seg@data[, Source := 2L]
+# QC: lidR::plot(las_uav_seg, color = "TreeID", colorPalette = rainbow(50), bg = "white")
+
+# 3.6c  Stem matching  (LSAP — globally optimal 1:1 assignment)
+# TLS stems: XY from lower 25% of cloud (more stable than TreeLocX/Y in scanner CRS post-registration)
+tls_stems <- las_tls_reg@data[!is.na(TreeID) & TreeID > 0L,
+  {
+    z_lo <- min(Z) + (max(Z) - min(Z)) * 0.25   # lower quartile of tree height
+    .(X_stem = mean(X[Z <= z_lo]), Y_stem = mean(Y[Z <= z_lo]), H_m = max(Z) - min(Z))
+  },
+  by = TreeID]
+
+uav_stems <- las_uav_seg@data[!is.na(TreeID) & TreeID > 0L & !is.na(TreeLocX),
+               .(X_stem = mean(TreeLocX), Y_stem = mean(TreeLocY), H_m = max(Z) - min(Z)),
+               by = TreeID]
+
+tls_std <- TreeMatching::standardize(as.data.frame(tls_stems), "X_stem", "Y_stem", "H_m", "m", crs = utm_crs, idname = "TreeID")
+uav_std <- TreeMatching::standardize(as.data.frame(uav_stems), "X_stem", "Y_stem", "H_m", "m", crs = utm_crs, idname = "TreeID")
+
+plot_ctr_x <- mean(range(tls_stems$X_stem))
+plot_ctr_y <- mean(range(tls_stems$Y_stem))
+plot_r_m   <- max(sqrt((tls_stems$X_stem - plot_ctr_x)^2 + (tls_stems$Y_stem - plot_ctr_y)^2)) + 5
+
+treemap <- TreeMatching::make_mapmatching(tls_std, uav_std, center = c(plot_ctr_x, plot_ctr_y), radius = plot_r_m)
+treemap <- TreeMatching::match_trees(treemap, dxymax = uav_stem_match_radius, dzmax = 50, zrel = 40)
+# QC: plot(treemap, scale = 2)
+print(treemap)
+
+mt      <- data.table::as.data.table(treemap$match_table)
+matches <- mt[state == "Matched", .(tls_TreeID = id_inventory, uav_TreeID = id_measure)]
+message(sprintf("[3.6c] Matched %d / %d TLS trees (%.0f%%) [LSAP].",
+                nrow(matches), nrow(tls_stems), 100 * nrow(matches) / nrow(tls_stems)))
+
+# 3.6d  Fuse: relabel matched UAV points to TLS TreeID; new IDs for unmatched UAV trees
+uav_data <- data.table::copy(las_uav_seg@data)
+uav_data[TreeID %in% matches$uav_TreeID, TreeID := matches$tls_TreeID[match(TreeID, matches$uav_TreeID)]]
+
+unmatched_uav_ids <- setdiff(
+  las_uav_seg@data[TreeID > 0L & !is.na(TreeID), unique(TreeID)],
+  matches$uav_TreeID)
+if (length(unmatched_uav_ids) > 0L) {
+  max_id  <- max(las_tls_reg@data$TreeID, na.rm = TRUE)
+  new_map <- setNames(seq_along(unmatched_uav_ids) + max_id, as.character(unmatched_uav_ids))
+  uav_data[TreeID %in% unmatched_uav_ids, TreeID := new_map[as.character(TreeID)]]
+  message(sprintf("[3.6d] %d unmatched UAV trees \u2192 new IDs %d\u2013%d.",
+                  length(unmatched_uav_ids), max_id + 1L, max_id + length(unmatched_uav_ids)))
+}
+las_uav_seg@data <- uav_data
+
+las_fused <- rbind(las_tls_reg, las_uav_seg)
+las_fused <- lidR::add_lasattribute(las_fused, las_fused@data[["Source"]], "Source", "Point source (1=TLS 2=UAV)")
+lidR::writeLAS(las_fused, file.path(out_dir, "checkpoint_02d_fused.laz"))
+message(sprintf("[3.6d] Fused: %d TLS + %d UAV = %d pts, %d trees.",
+                npoints(las_tls_reg), npoints(las_uav_seg), npoints(las_fused),
+                las_fused@data[TreeID > 0L & !is.na(TreeID), data.table::uniqueN(TreeID)]))
+# QC: lidR::plot(las_fused, color = "Source", colorPalette = c("steelblue", "tomato"), bg = "white")
+
+
+
+
+
+
 
 # ============================================================================
 # 4. WoodCls  (wood / foliage classification)
+# Run per source: TLS 2.5 cm model on TLS points, UAV 8 cm model on UAV points.
+# Missing columns (e.g. StemCls absent from UAV) are filled with NA on rbind.
 # ============================================================================
-las_woodcls <- treeAIBoxR::woodcls(
-  las_segmented,
+las_tls_pts <- lidR::filter_poi(las_fused, Source == 1L)
+las_uav_pts <- lidR::filter_poi(las_fused, Source == 2L)
+
+# TLS WoodCls
+las_tls_wc <- treeAIBoxR::woodcls(
+  las_tls_pts,
   model     = "woodcls_branch_tls_esegformer3D_128_2.5cm(GPU3GB)",
   sensor    = "tls",
   component = "branch",
   cuda      = TRUE,
   verbose   = TRUE
 )
-
-las_woodcls <- treeAIBoxR::woodcls(
-  las_woodcls,
+las_tls_wc <- treeAIBoxR::woodcls(
+  las_tls_wc,
   model               = "woodcls_branch_tls_esegformer3D_128_2.5cm(GPU3GB)",
   component           = "downed_log",
   downed_z_max        = 1.5,    # m above ground (Xi 2023)
@@ -237,8 +405,29 @@ las_woodcls <- treeAIBoxR::woodcls(
   verbose             = TRUE
 )
 
+# UAV WoodCls (8 cm model; skipped if no UAV points present)
+if (npoints(las_uav_pts) > 0L) {
+  las_uav_wc <- treeAIBoxR::woodcls(
+    las_uav_pts,
+    model     = "woodcls_branch_uav_esegformer3D_128_8cm(GPU3GB)",
+    sensor    = "uav",
+    component = "branch",
+    cuda      = TRUE,
+    verbose   = TRUE
+  )
+} else {
+  las_uav_wc <- las_uav_pts
+}
+
+# Merge and assign 8-class forest components.
+# UAV points: StemCls = NA -> ComponentClass derived from WoodLabel alone.
+las_woodcls <- rbind(las_tls_wc, las_uav_wc)
 las_woodcls <- treeAIBoxR::forest_components(las_woodcls)
 
+# Register woodcls/forest_components output columns as LAS extra bytes so writeLAS() persists them.
+las_woodcls <- lidR::add_lasattribute(las_woodcls, las_woodcls@data[["WoodLabel"]],      "WoodLabel",      "Wood label")
+las_woodcls <- lidR::add_lasattribute(las_woodcls, las_woodcls@data[["DownedLog"]],      "DownedLog",      "Downed log flag")
+las_woodcls <- lidR::add_lasattribute(las_woodcls, las_woodcls@data[["ComponentClass"]], "ComponentClass", "Forest component class")
 writeLAS(las_woodcls, file.path(out_dir, "checkpoint_03_woodcls.laz"))
 # QC: xi_pal <- c("0"="#aaff01","1"="#f02b00","2"="#7a4101","3"="#0a9e00","4"="#9f0aef","5"="#f54b8c","6"="#ae5504","7"="#0000fe")
 # QC: plot(las, color = "ComponentClass", colorPalette = xi_pal)
