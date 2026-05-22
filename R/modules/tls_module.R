@@ -90,7 +90,7 @@ las_preproc <- filter_duplicates(las_raw)
 
 # 2.2 Statistical outlier removal
 npts0 <- npoints(las_preproc)
-las_preproc <- classify_noise(las_preproc, sor(k = 8, m = 3))
+las_preproc <- classify_noise(las_preproc, sor(k = 10, m = 1))
 las_preproc <- filter_poi(las_preproc, Classification != LASNOISE)
 message(sprintf("SOR: removed %d / %d points (%.2f%%) as noise.",
                 npts0 - npoints(las_preproc), npts0,
@@ -98,6 +98,8 @@ message(sprintf("SOR: removed %d / %d points (%.2f%%) as noise.",
 
 # 2.3 Point decimation (3D) — one random point per 2 cm voxel.
 # RS10 SLAM inter-frame error ~2 cm; no sub-2cm geometry is recoverable.
+# Decimation before ICP produces more uniform point spacing, which improves
+# correspondence quality vs. the raw density-gradient cloud.
 npts1 <- npoints(las_preproc)
 las_preproc <- decimate_points(las_preproc, random_per_voxel(res = 0.02))
 message(sprintf("Decimate: %d -> %d points (%.1f%% retained).",
@@ -167,15 +169,17 @@ writeLAS(las_filtered, file.path(out_dir, "checkpoint_03a_treefilter.laz"))
 
 # 3.2 TreeisoNet: StemCls -> TreeLoc -> shortestpath3D -> CrownOff3D -> CrownClustersSP.
 #     Adds TreeID, StemCls, TreeLocX, TreeLocY. Runs on overstory points only.
+#     Out-of-plot trees form their own segments; Section 3.3 deletes them, preserving
+#     full crown geometry for in-plot trees near the boundary.
 las_segmented <- treeAIBoxR::treeisonet(
   las_filtered,
   stemcls_model        = "treeisonet_tls_boreal_stemcls_esegformer3D_128_4cm(GPU3GB)",
   treeloc_model        = "treeisonet_tls_boreal_treeloc_esegformer3D_128_10cm(GPU3GB)",
   crownoff_model       = "treeisonet_tls_boreal_crownoff_esegformer3D_128_15cm(GPU4GB)",
-  conf_thresh          = 0.15,  # Python hardcodes 0.1; raised to 0.15 to suppress sapling phantoms (trees 109,162,198,221,406,526)
-  max_isolated_dist    = 0.12,  # default 0.3 m - 3x voxel size; bridges stem/crown gaps without jumping trees
-  k_graph              = 10L,   # Python stemCluster.shortestpath3D uses k=min(len,10) hardcoded
-  k_node               = 10L,   # Python stemCluster.create_node_graph() uses k=10 hardcoded; R default was 20
+  conf_thresh          = 0.15,  # Python hardcodes 0.1; raised to 0.15 to suppress sapling phantoms
+  max_isolated_dist    = 0.12,  # 3x voxel size; bridges stem/crown gaps without jumping trees
+  k_graph              = 10L,   # matches Python stemCluster.shortestpath3D hardcoded k
+  k_node               = 10L,   # matches Python stemCluster.create_node_graph() k; R default was 20
   stemcls_min_points   = 200L,  # Python default 100; raised to 200 as second gate against sapling stem clusters
   cuda                 = TRUE,
   verbose              = TRUE
@@ -207,6 +211,21 @@ las_segmented <- filter_poi(las_segmented, TreeID %in% pt_ids)
 message(sprintf("[3] Point filter: %d trees >= %d pts (dropped %d).",
                 length(pt_ids), min_tree_points,
                 length(hgt_ids) - length(pt_ids)))
+
+# 3.5b Per-point spatial clip: remove distant TLS returns absorbed by CrownOff3D.
+# The TLS scanner captures overstory returns out to 80m+ range. treeisonet() forms
+# separate out-of-plot tree segments which Section 3.3 deletes by base position.
+# But CrownOff3D can still absorb scattered distant returns into in-plot tree IDs;
+# those points survive Section 3.3 because their tree BASE is within r_max.
+# Clip to r_max + crown_extension_m to remove that residual scatter while retaining
+# full crown geometry for in-plot trees near the boundary.
+crown_extension_m <- 5.0   # m; headroom beyond plot edge for crown geometry
+npts_before_clip <- npoints(las_segmented)
+las_segmented <- filter_poi(las_segmented,
+  sqrt((X - plot_ctr_x)^2 + (Y - plot_ctr_y)^2) <= (r_max + crown_extension_m))
+message(sprintf("[3] Spatial clip (r <= %.1f m): %d -> %d pts (removed %d).",
+                r_max + crown_extension_m, npts_before_clip, npoints(las_segmented),
+                npts_before_clip - npoints(las_segmented)))
 
 # Register treeisonet output columns as LAS extra bytes so writeLAS() persists them.
 las_segmented <- lidR::add_lasattribute(las_segmented, las_segmented@data[["TreeID"]],   "TreeID",   "Tree ID")
@@ -293,89 +312,194 @@ if (TRUE) {   # set FALSE to skip
 # ============================================================================
 
 # TLS-only fallback — run this block and skip to Section 4 if no UAV.
-las_fused <- las_segmented
-data.table::setDT(las_fused@data)
-las_fused@data[, Source := 1L]
+#las_fused <- las_segmented
+#data.table::setDT(las_fused@data)
+#las_fused@data[, Source := 1L]
 
-# 3.6a  UAV treeisonet  (clipped to plot extent before segmentation)
+# 3.6a  UAV treefiltering + treeisonet  -----------------------------------------
 las_uav_raw <- lidR::readLAS(uav_input,
                  filter = paste("-keep_circle",
                                 plot_utm_easting, plot_utm_northing,
                                 plot_radius + plot_buffer + 5))
 message(sprintf("[3.6a] UAV clip: %d pts.", npoints(las_uav_raw)))
-# QC: lidR::plot(las_uav_raw, color = "Z", bg = "white")
+
+# Decimate to 8 cm voxels (matches stemcls model resolution; reduces redundant pts).
+npts_uav0   <- npoints(las_uav_raw)
+las_uav_raw <- lidR::decimate_points(las_uav_raw, lidR::random_per_voxel(res = 0.08))
+message(sprintf("[3.6a] UAV decimate: %d -> %d pts (%.1f%% retained).",
+                npts_uav0, npoints(las_uav_raw), 100 * npoints(las_uav_raw) / npts_uav0))
+
+las_uav_filt <- treeAIBoxR::treefiltering(
+  las_uav_raw,
+  model   = "treefiltering_uav_esegformer3D_128_12cm(GPU3GB)",
+  sensor  = "uav",
+  cuda    = TRUE,
+  verbose = TRUE
+)
+las_uav_filt <- lidR::add_lasattribute(las_uav_filt,
+  las_uav_filt@data[["TreeFilterLabel"]], "TreeFilterLabel", "Tree filter label")
 
 las_uav_seg <- treeAIBoxR::treeisonet(
-  las_uav_raw,
-  sensor         = "uav",
-  stemcls_model  = "treeisonet_uav_mixedwood_stemcls_esegformer3D_128_8cm(GPU3GB)",
-  treeloc_model  = "treeisonet_uav_mixedwood_treeloc_esegformer3D_128_10cm(GPU3GB)",
-  crownoff_model = "treeisonet_uav_mixedwood_crownoff_esegformer3D_128_15cm(GPU4GB)",
-  cuda           = TRUE,
-  verbose        = TRUE
+  las_uav_filt,
+  sensor             = "uav",
+  stemcls_model      = "treeisonet_uav_mixedwood_stemcls_esegformer3D_128_8cm(GPU3GB)",
+  treeloc_model      = "treeisonet_uav_mixedwood_treeloc_esegformer3D_128_10cm(GPU3GB)",
+  crownoff_model     = "treeisonet_uav_mixedwood_crownoff_esegformer3D_128_15cm(GPU4GB)",
+  conf_thresh        = 0.15,
+  max_isolated_dist  = 0.3,
+  stemcls_min_points = 100L,
+  cuda               = TRUE,
+  verbose            = TRUE
 )
 las_uav_seg <- lidR::add_lasattribute(las_uav_seg, las_uav_seg@data[["TreeID"]],   "TreeID",   "Tree ID")
 las_uav_seg <- lidR::add_lasattribute(las_uav_seg, las_uav_seg@data[["StemCls"]],  "StemCls",  "Stem class")
 las_uav_seg <- lidR::add_lasattribute(las_uav_seg, las_uav_seg@data[["TreeLocX"]], "TreeLocX", "Tree base X (m)")
 las_uav_seg <- lidR::add_lasattribute(las_uav_seg, las_uav_seg@data[["TreeLocY"]], "TreeLocY", "Tree base Y (m)")
-lidR::writeLAS(las_uav_seg, file.path(out_dir, "checkpoint_04_uav_segmented.laz"))
 data.table::setDT(las_uav_seg@data)
 las_uav_seg@data[, Source := 2L]
-# QC: lidR::plot(las_uav_seg, color = "TreeID", colorPalette = rainbow(50), bg = "white")
 
-# 3.6b  Stem matching  (LSAP — globally optimal 1:1 assignment)
-# Both TLS and UAV TreeLocX/Y are in UTM (treeisonet ran on registered clouds).
+# Post-filters mirroring TLS 3.3-3.5: plot boundary, minimum height, minimum points.
+uav_r_max     <- plot_radius + plot_buffer
+uav_tree_locs <- las_uav_seg@data[TreeID > 0L & !is.na(TreeLocX),
+                   .(lx = TreeLocX[1L], ly = TreeLocY[1L]), by = TreeID]
+uav_plot_ids  <- uav_tree_locs[sqrt((lx - plot_ctr_x)^2 + (ly - plot_ctr_y)^2) <= uav_r_max, TreeID]
+las_uav_seg   <- lidR::filter_poi(las_uav_seg, TreeID %in% uav_plot_ids)
+
+uav_heights   <- las_uav_seg@data[TreeID > 0L, .(height = max(Z) - min(Z)), by = TreeID]
+uav_hgt_ids   <- uav_heights[height >= min_tree_height_m, TreeID]
+las_uav_seg   <- lidR::filter_poi(las_uav_seg, TreeID %in% uav_hgt_ids)
+
+uav_counts    <- las_uav_seg@data[TreeID > 0L, .N, by = TreeID]
+uav_pt_ids    <- uav_counts[N >= min_tree_points, TreeID]
+las_uav_seg   <- lidR::filter_poi(las_uav_seg, TreeID %in% uav_pt_ids)
+message(sprintf("[3.6a] UAV after filters: %d trees.",
+                las_uav_seg@data[TreeID > 0L & !is.na(TreeID), data.table::uniqueN(TreeID)]))
+
+# Per-point spatial clip (mirrors TLS 3.5b): remove distant UAV returns that
+# CrownOff3D absorbed into in-plot tree IDs (those points survive the base filter
+# in Section 3.3 because their assigned tree base is within uav_r_max).
+uav_npts_before_clip <- npoints(las_uav_seg)
+las_uav_seg <- lidR::filter_poi(las_uav_seg,
+  sqrt((X - plot_ctr_x)^2 + (Y - plot_ctr_y)^2) <= (uav_r_max + crown_extension_m))
+message(sprintf("[3.6a] Spatial clip (r <= %.1f m): %d -> %d pts (removed %d).",
+                uav_r_max + crown_extension_m, uav_npts_before_clip,
+                npoints(las_uav_seg), uav_npts_before_clip - npoints(las_uav_seg)))
+
+# Checkpoint written after filters so reloading always yields the filtered cloud.
+lidR::writeLAS(las_uav_seg, file.path(out_dir, "checkpoint_04_uav_segmented.laz"))
+# Recovery: las_uav_seg <- lidR::readLAS(file.path(out_dir, "checkpoint_04_uav_segmented.laz"))
+#           data.table::setDT(las_uav_seg@data) ; las_uav_seg@data[, Source := 2L]
+# QC: lidR::plot(las_uav_seg, color = "TreeID", pal = rainbow(50), bg = "white")
+
+# 3.6b  Stem matching  (LSAP) ---------------------------------------------------
 data.table::setDT(las_segmented@data)
 las_segmented@data[, Source := 1L]
 
 tls_stems <- las_segmented@data[!is.na(TreeID) & TreeID > 0L & !is.na(TreeLocX),
                .(X_stem = mean(TreeLocX), Y_stem = mean(TreeLocY), H_m = max(Z) - min(Z)),
                by = TreeID]
-
 uav_stems <- las_uav_seg@data[!is.na(TreeID) & TreeID > 0L & !is.na(TreeLocX),
                .(X_stem = mean(TreeLocX), Y_stem = mean(TreeLocY), H_m = max(Z) - min(Z)),
                by = TreeID]
+# uav_stems already has only filtered trees; retain the same height + plot guards
+# for consistency with future runs that may reload from checkpoint.
+uav_stems <- uav_stems[H_m >= min_tree_height_m]
+uav_stems <- uav_stems[sqrt((X_stem - plot_ctr_x)^2 + (Y_stem - plot_ctr_y)^2) <= uav_r_max]
+message(sprintf("[3.6b] TLS stems: %d   UAV stems: %d.", nrow(tls_stems), nrow(uav_stems)))
 
-tls_std <- TreeMatching::standardize(as.data.frame(tls_stems), "X_stem", "Y_stem", "H_m", "m", crs = utm_crs, idname = "TreeID")
-uav_std <- TreeMatching::standardize(as.data.frame(uav_stems), "X_stem", "Y_stem", "H_m", "m", crs = utm_crs, idname = "TreeID")
-
-match_ctr_x <- mean(range(tls_stems$X_stem))
-match_ctr_y <- mean(range(tls_stems$Y_stem))
-plot_r_m    <- max(sqrt((tls_stems$X_stem - match_ctr_x)^2 + (tls_stems$Y_stem - match_ctr_y)^2)) + 5
-
-treemap <- TreeMatching::make_mapmatching(tls_std, uav_std, center = c(match_ctr_x, match_ctr_y), radius = plot_r_m)
-treemap <- TreeMatching::match_trees(treemap, dxymax = uav_stem_match_radius, dzmax = 50, zrel = 40)
-# QC: plot(treemap, scale = 2)
+tls_std <- TreeMatching::standardize(as.data.frame(tls_stems),
+             "X_stem", "Y_stem", "H_m", "m", crs = utm_crs, idname = "TreeID")
+uav_std <- TreeMatching::standardize(as.data.frame(uav_stems),
+             "X_stem", "Y_stem", "H_m", "m", crs = utm_crs, idname = "TreeID")
+treemap <- TreeMatching::make_mapmatching(tls_std, uav_std,
+             center = c(plot_ctr_x, plot_ctr_y), radius = uav_r_max)
+treemap <- TreeMatching::match_trees(treemap, dxymax = 2.5, dzmax = 50, zrel = 0)
 print(treemap)
+# QC: plot(treemap, scale = 2)
 
 mt      <- data.table::as.data.table(treemap$match_table)
 matches <- mt[state == "Matched", .(tls_TreeID = id_inventory, uav_TreeID = id_measure)]
-message(sprintf("[3.6b] Matched %d / %d TLS trees (%.0f%%) [LSAP].",
+message(sprintf("[3.6b] Matched %d / %d TLS trees (%.0f%%).",
                 nrow(matches), nrow(tls_stems), 100 * nrow(matches) / nrow(tls_stems)))
 
-# 3.6c  Fuse: relabel matched UAV points to TLS TreeID; new IDs for unmatched UAV trees
+# 3.6c  Fuse  -------------------------------------------------------------------
+# Matched UAV trees: relabel to TLS TreeID (points fuse into same tree object).
+# Unmatched UAV trees: assign new IDs above the TLS ID range (UAV-only trees).
 uav_data <- data.table::copy(las_uav_seg@data)
-uav_data[TreeID %in% matches$uav_TreeID, TreeID := matches$tls_TreeID[match(TreeID, matches$uav_TreeID)]]
+uav_data[TreeID %in% matches$uav_TreeID,
+         TreeID := matches$tls_TreeID[match(TreeID, matches$uav_TreeID)]]
 
-unmatched_uav_ids <- setdiff(
-  las_uav_seg@data[TreeID > 0L & !is.na(TreeID), unique(TreeID)],
-  matches$uav_TreeID)
+unmatched_uav_ids <- setdiff(uav_stems$TreeID, matches$uav_TreeID)
 if (length(unmatched_uav_ids) > 0L) {
   max_id  <- max(las_segmented@data$TreeID, na.rm = TRUE)
-  new_map <- setNames(seq_along(unmatched_uav_ids) + max_id, as.character(unmatched_uav_ids))
-  uav_data[TreeID %in% unmatched_uav_ids, TreeID := new_map[as.character(TreeID)]]
+  new_map <- setNames(seq_along(unmatched_uav_ids) + max_id,
+                      as.character(unmatched_uav_ids))
+  uav_data[TreeID %in% unmatched_uav_ids,
+           TreeID := new_map[as.character(TreeID)]]
   message(sprintf("[3.6c] %d unmatched UAV trees \u2192 new IDs %d\u2013%d.",
-                  length(unmatched_uav_ids), max_id + 1L, max_id + length(unmatched_uav_ids)))
+                  length(unmatched_uav_ids), max_id + 1L,
+                  max_id + length(unmatched_uav_ids)))
 }
 las_uav_seg@data <- uav_data
 
+# Harmonise schemas: add missing columns with type-safe defaults, then zero-fill
+# any NAs in standard LAS fields.  Must be done inline (not in a helper function)
+# because [[<- on an S4 slot only persists when called directly on the slot.
+.custom_las_cols <- c("TreeID", "TreeLocX", "TreeLocY", "StemCls",
+                      "TreeFilterLabel", "conf", "Source")
+.las_fill_val <- function(col, ref_dt) {
+  cl <- class(ref_dt[[col]])[1]
+  if (col %in% .custom_las_cols)          return(NA)
+  if (cl == "logical")                    return(FALSE)
+  if (cl %in% c("integer", "raw"))        return(0L)
+  if (cl %in% c("numeric", "double"))     return(0.0)
+  NA
+}
+# Add columns missing from UAV
+for (.col in setdiff(names(las_segmented@data), names(las_uav_seg@data)))
+  las_uav_seg@data[[.col]] <- .las_fill_val(.col, las_segmented@data)
+# Add columns missing from TLS
+for (.col in setdiff(names(las_uav_seg@data), names(las_segmented@data)))
+  las_segmented@data[[.col]] <- .las_fill_val(.col, las_uav_seg@data)
+
+# Zero-fill NAs in non-custom columns (e.g. ScannerChannel / ScanAngle in UAV).
+for (.f in setdiff(names(las_uav_seg@data), .custom_las_cols)) {
+  if (anyNA(las_uav_seg@data[[.f]])) {
+    cl <- class(las_uav_seg@data[[.f]])[1]
+    if (cl == "logical")
+      las_uav_seg@data[is.na(get(.f)), (.f) := FALSE]
+    else if (cl %in% c("integer", "raw"))
+      las_uav_seg@data[is.na(get(.f)), (.f) := 0L]
+    else if (cl %in% c("numeric", "double"))
+      las_uav_seg@data[is.na(get(.f)), (.f) := 0.0]
+  }
+}
+for (.f in setdiff(names(las_segmented@data), .custom_las_cols)) {
+  if (anyNA(las_segmented@data[[.f]])) {
+    cl <- class(las_segmented@data[[.f]])[1]
+    if (cl == "logical")
+      las_segmented@data[is.na(get(.f)), (.f) := FALSE]
+    else if (cl %in% c("integer", "raw"))
+      las_segmented@data[is.na(get(.f)), (.f) := 0L]
+    else if (cl %in% c("numeric", "double"))
+      las_segmented@data[is.na(get(.f)), (.f) := 0.0]
+  }
+}
+
+# Align column order so lidR's rbind (positional matching) is safe.
+all_cols <- union(names(las_segmented@data), names(las_uav_seg@data))
+data.table::setcolorder(las_segmented@data, all_cols)
+data.table::setcolorder(las_uav_seg@data,   all_cols)
+
 las_fused <- rbind(las_segmented, las_uav_seg)
-las_fused <- lidR::add_lasattribute(las_fused, las_fused@data[["Source"]], "Source", "Point source (1=TLS 2=UAV)")
+las_fused <- lidR::add_lasattribute(las_fused, las_fused@data[["Source"]],
+               "Source", "Point source (1=TLS 2=UAV)")
 lidR::writeLAS(las_fused, file.path(out_dir, "checkpoint_05_fused.laz"))
-message(sprintf("[3.6c] Fused: %d TLS + %d UAV = %d pts, %d trees.",
+message(sprintf("[3.6c] Fused: %d TLS + %d UAV = %d pts, %d unique trees.",
                 npoints(las_segmented), npoints(las_uav_seg), npoints(las_fused),
                 las_fused@data[TreeID > 0L & !is.na(TreeID), data.table::uniqueN(TreeID)]))
-# QC: lidR::plot(las_fused, color = "Source", colorPalette = c("steelblue", "tomato"), bg = "white")
+# QC
+lidR::plot(las_fused, color = "Source", pal = c("steelblue", "tomato"), bg = "white")
 
 
 
@@ -426,6 +550,14 @@ if (npoints(las_uav_pts) > 0L) {
 
 # Merge and assign 8-class forest components.
 # UAV points: StemCls = NA -> ComponentClass derived from WoodLabel alone.
+# Harmonise schemas before rbind (TLS has DownedLog; UAV branch-only pass does not).
+for (.col in setdiff(names(las_tls_wc@data), names(las_uav_wc@data)))
+  las_uav_wc@data[[.col]] <- .las_fill_val(.col, las_tls_wc@data)
+for (.col in setdiff(names(las_uav_wc@data), names(las_tls_wc@data)))
+  las_tls_wc@data[[.col]] <- .las_fill_val(.col, las_uav_wc@data)
+.wc_all_cols <- union(names(las_tls_wc@data), names(las_uav_wc@data))
+data.table::setcolorder(las_tls_wc@data, .wc_all_cols)
+data.table::setcolorder(las_uav_wc@data, .wc_all_cols)
 las_woodcls <- rbind(las_tls_wc, las_uav_wc)
 las_woodcls <- treeAIBoxR::forest_components(las_woodcls)
 
